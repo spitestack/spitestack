@@ -1,0 +1,104 @@
+//! # SpiteDB - Event Store Runtime
+//!
+//! SpiteDB is a production-grade event store built on SQLite. It provides:
+//!
+//! - **Event sourcing primitives**: streams, revisions, ordered global log
+//! - **High-throughput writes**: via group commit and batching
+//! - **Exactly-once semantics**: through command idempotency
+//! - **High availability**: with automatic failover and epoch-based fencing
+//! - **GDPR compliance**: tombstones and compaction for data deletion
+//!
+//! ## Architecture Overview
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                        Async API Layer                          │
+//! │                    (append, read, subscribe)                    │
+//! └─────────────────────────────┬───────────────────────────────────┘
+//!                               │
+//!                               ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                       Writer Actor                              │
+//! │              (single thread, owns write connection)             │
+//! │                                                                 │
+//! │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
+//! │  │ Group Commit│  │  SAVEPOINT  │  │  In-Memory State        │ │
+//! │  │   Batcher   │  │  Isolation  │  │  (stream heads, pos)    │ │
+//! │  └─────────────┘  └─────────────┘  └─────────────────────────┘ │
+//! └─────────────────────────────┬───────────────────────────────────┘
+//!                               │
+//!                               ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                         SQLite                                  │
+//! │                   (durable storage)                             │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Core Invariants
+//!
+//! These invariants are enforced throughout the codebase and must never be violated:
+//!
+//! 1. **Single logical writer**: Only one node may write at any time
+//! 2. **Durable ordering**: `global_pos` strictly increases, never reused
+//! 3. **Stream correctness**: `stream_rev` strictly increases per stream, no gaps
+//! 4. **Memory safety**: In-memory state may lag disk, but never leads disk
+//! 5. **Exactly-once**: Duplicate commands return cached results, never duplicate events
+//!
+//! ## Module Organization
+//!
+//! - [`error`]: Custom error types for all failure modes
+//! - [`schema`]: SQLite DDL and database initialization
+//! - [`types`]: Domain types (StreamId, Event, GlobalPos, etc.)
+//!
+//! Future modules (not yet implemented):
+//! - `storage`: Synchronous storage operations
+//! - `writer`: Group commit and batching logic
+//! - `ha`: High availability and epoch fencing
+
+// =============================================================================
+// Module Declarations
+// =============================================================================
+// Rust pattern: `mod` declares a module, making its contents available.
+// Public modules (`pub mod`) are part of the library's API.
+// Private modules are internal implementation details.
+
+/// Error types for SpiteDB operations.
+///
+/// This module defines all error variants that can occur during database
+/// operations. Using a single error enum simplifies error handling for callers.
+pub mod error;
+
+/// SQLite schema definitions and database initialization.
+///
+/// This module contains the DDL statements for all tables and the logic
+/// to initialize a new database or verify an existing one.
+pub mod schema;
+
+/// Domain types for event sourcing.
+///
+/// This module defines the core types: streams, events, positions, revisions,
+/// and commands. Uses the newtype pattern for type safety.
+pub mod types;
+
+/// Synchronous storage layer.
+///
+/// This module provides the core storage operations: appending events,
+/// reading streams, and reading from the global log. It wraps SQLite
+/// and maintains an in-memory cache of stream heads.
+pub mod storage;
+
+// =============================================================================
+// Re-exports
+// =============================================================================
+// Rust pattern: Re-export commonly used types at the crate root for convenience.
+// Users can write `use spitedb::Error` instead of `use spitedb::error::Error`.
+
+pub use error::{Error, Result};
+pub use schema::Database;
+pub use storage::Storage;
+
+// Re-export commonly used types from the types module
+pub use types::{
+    AppendCommand, AppendResult, CollisionSlot, CommandId, Event, EventData, GlobalPos,
+    StreamHash, StreamId, StreamRev,
+};
