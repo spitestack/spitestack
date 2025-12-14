@@ -41,6 +41,14 @@ thiserror = "2"
 # - xxh3 feature enables the 64-bit XXH3 variant
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+# =============================================================================
+# Caching
+# =============================================================================
+# lru: O(1) LRU cache implementation
+# - Used for command idempotency cache with time-based eviction
+# - Prevents unbounded memory growth from stored command results
+lru = "0.12"
+
 [dev-dependencies]
 # tempfile: Create temporary files/directories for testing
 # - Automatically cleaned up when TempDir goes out of scope

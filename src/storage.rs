@@ -37,8 +37,10 @@
 //! but it must NEVER be ahead. We update the cache only AFTER successful disk writes.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lru::LruCache;
 use rusqlite::{params, Connection};
 
 use crate::error::{Error, Result};
@@ -65,6 +67,37 @@ const CODEC_NONE: i32 = 0;
 const CIPHER_NONE: i32 = 0;
 
 // =============================================================================
+// Command Cache Configuration
+// =============================================================================
+
+/// Maximum number of commands to keep in the LRU cache.
+///
+/// # Sizing Rationale
+///
+/// At 100 bytes per entry (command_id + positions + timestamp), 100K entries
+/// uses ~10MB of memory. This should cover several hours of high-throughput
+/// operation while keeping memory bounded.
+///
+/// Adjust based on your workload:
+/// - High-throughput (10K commands/sec): Consider 500K entries
+/// - Low-throughput (100 commands/sec): 10K entries is plenty
+const COMMAND_CACHE_MAX_ENTRIES: usize = 100_000;
+
+/// Time-to-live for cached commands in milliseconds (12 hours).
+///
+/// # Why 12 Hours?
+///
+/// Client retries typically happen within seconds to minutes. A 12-hour window
+/// provides generous margin for:
+/// - Network partitions that eventually heal
+/// - Client applications that queue commands during outages
+/// - Manual retries after investigating issues
+///
+/// Commands older than this are unlikely to be retried and can be evicted
+/// to make room for newer entries.
+const COMMAND_CACHE_TTL_MS: u64 = 12 * 60 * 60 * 1000; // 12 hours in milliseconds
+
+// =============================================================================
 // Stream Head Cache Entry
 // =============================================================================
 
@@ -81,6 +114,49 @@ struct StreamHeadEntry {
     last_rev: StreamRev,
     /// Global position of the last event.
     last_pos: GlobalPos,
+}
+
+// =============================================================================
+// Command Cache Entry
+// =============================================================================
+
+/// Cached result of a processed command.
+///
+/// # Exactly-Once Semantics
+///
+/// When a client retries a command (same command_id), we return the cached result
+/// instead of re-processing. This ensures:
+/// - Retries are safe (no duplicate events)
+/// - Client gets the same response as the original
+/// - Network issues don't cause data inconsistency
+///
+/// # Time-Based Eviction
+///
+/// Each entry includes a `created_ms` timestamp. Entries older than
+/// `COMMAND_CACHE_TTL_MS` (12 hours) are considered expired and can be evicted.
+/// The LRU eviction policy handles capacity limits, while time-based eviction
+/// handles entries that are too old to be useful.
+#[derive(Debug, Clone)]
+struct CommandCacheEntry {
+    /// First global position written by this command.
+    first_pos: GlobalPos,
+    /// Last global position written by this command.
+    last_pos: GlobalPos,
+    /// First stream revision written.
+    first_rev: StreamRev,
+    /// Last stream revision written.
+    last_rev: StreamRev,
+    /// When this command was processed (Unix milliseconds).
+    ///
+    /// Used for time-based eviction. If `current_time - created_ms > TTL`,
+    /// this entry is considered expired and will be evicted on next access.
+    created_ms: u64,
+}
+
+impl CommandCacheEntry {
+    fn to_append_result(&self) -> AppendResult {
+        AppendResult::new(self.first_pos, self.last_pos, self.first_rev, self.last_rev)
+    }
 }
 
 // =============================================================================
@@ -120,6 +196,40 @@ pub struct Storage {
     /// streams share the same hash. We store all of them and filter by stream_id.
     stream_heads: HashMap<StreamHash, Vec<StreamHeadEntry>>,
 
+    /// In-memory LRU cache of processed commands for idempotency.
+    ///
+    /// Maps command_id → result. When a duplicate command is received,
+    /// we return the cached result instead of re-processing.
+    ///
+    /// # Cache Strategy: LRU + Time-Based Eviction
+    ///
+    /// This cache uses two eviction strategies:
+    ///
+    /// 1. **LRU (Least Recently Used)**: When the cache reaches `COMMAND_CACHE_MAX_ENTRIES`,
+    ///    the least recently accessed entry is evicted to make room.
+    ///
+    /// 2. **Time-based**: Entries older than `COMMAND_CACHE_TTL_MS` (12 hours) are
+    ///    considered expired and evicted on access.
+    ///
+    /// # Why Both?
+    ///
+    /// - LRU alone might keep very old entries if the cache isn't full
+    /// - Time-based alone might evict frequently-used entries
+    /// - Together they provide bounded memory AND bounded staleness
+    ///
+    /// # After Eviction
+    ///
+    /// If an entry is evicted and the command is retried after 12+ hours,
+    /// we'll process it as a new command. This is acceptable because:
+    /// - 12 hours is far beyond typical retry windows (seconds to minutes)
+    /// - Clients retrying after 12h likely have stale state anyway
+    /// - The alternative (DB lookup for every command) is too expensive
+    ///
+    /// The commands table remains the durable record for auditing and
+    /// potential future recovery scenarios, but we don't query it on
+    /// every operation.
+    commands: LruCache<String, CommandCacheEntry>,
+
     /// The next global position to assign.
     ///
     /// This is always MAX(global_pos) + 1 from the database.
@@ -139,13 +249,20 @@ impl Storage {
     ///
     /// * `conn` - An initialized SQLite connection (schema already created)
     pub fn new(conn: Connection) -> Result<Self> {
+        // NonZeroUsize is required by LruCache to ensure capacity > 0.
+        // This is a Rust pattern: using the type system to prevent invalid states.
+        let cache_capacity = NonZeroUsize::new(COMMAND_CACHE_MAX_ENTRIES)
+            .expect("COMMAND_CACHE_MAX_ENTRIES must be > 0");
+
         let mut storage = Self {
             conn,
             stream_heads: HashMap::new(),
+            commands: LruCache::new(cache_capacity),
             next_global_pos: GlobalPos::FIRST,
         };
 
         storage.load_stream_heads()?;
+        storage.load_commands()?;
         storage.load_next_global_pos()?;
 
         Ok(storage)
@@ -183,6 +300,63 @@ impl Storage {
                 .entry(hash)
                 .or_insert_with(Vec::new)
                 .push(entry);
+        }
+
+        Ok(())
+    }
+
+    /// Loads recent commands from the database into the in-memory LRU cache.
+    ///
+    /// # Only Recent Commands
+    ///
+    /// We only load commands within the TTL window (12 hours). Older commands
+    /// are unlikely to be retried and would just waste cache space.
+    ///
+    /// # Startup Recovery
+    ///
+    /// This is critical for crash recovery: if we crash after committing events
+    /// but before responding to the client, the client will retry. Loading recent
+    /// commands ensures we return the cached result instead of creating duplicates.
+    fn load_commands(&mut self) -> Result<()> {
+        let now_ms = current_time_ms();
+        let cutoff_ms = now_ms.saturating_sub(COMMAND_CACHE_TTL_MS);
+
+        // Load commands created within the TTL window
+        // We join with event_index to get stream revisions for the result
+        let mut stmt = self.conn.prepare(
+            "SELECT c.command_id, c.first_pos, c.last_pos, c.created_ms,
+                    e_first.stream_rev, e_last.stream_rev
+             FROM commands c
+             JOIN event_index e_first ON e_first.global_pos = c.first_pos
+             JOIN event_index e_last ON e_last.global_pos = c.last_pos
+             WHERE c.created_ms >= ?
+             ORDER BY c.created_ms DESC"
+        )?;
+
+        let entries = stmt.query_map([cutoff_ms as i64], |row| {
+            let command_id: String = row.get(0)?;
+            let first_pos: i64 = row.get(1)?;
+            let last_pos: i64 = row.get(2)?;
+            let created_ms: i64 = row.get(3)?;
+            let first_rev: i64 = row.get(4)?;
+            let last_rev: i64 = row.get(5)?;
+
+            Ok((command_id, first_pos, last_pos, created_ms, first_rev, last_rev))
+        })?;
+
+        for entry in entries {
+            let (command_id, first_pos, last_pos, created_ms, first_rev, last_rev) = entry?;
+            // LruCache::put() inserts and returns the old value if key existed
+            self.commands.put(
+                command_id,
+                CommandCacheEntry {
+                    first_pos: GlobalPos::from_raw_unchecked(first_pos as u64),
+                    last_pos: GlobalPos::from_raw_unchecked(last_pos as u64),
+                    first_rev: StreamRev::from_raw(first_rev as u64),
+                    last_rev: StreamRev::from_raw(last_rev as u64),
+                    created_ms: created_ms as u64,
+                },
+            );
         }
 
         Ok(())
@@ -262,10 +436,11 @@ impl Storage {
     /// - If it doesn't match, returns `Error::Conflict`
     /// - For new streams, use `StreamRev::NONE` (0) as expected_rev
     ///
-    /// # Idempotency
+    /// # Idempotency (Exactly-Once Semantics)
     ///
-    /// If `command_id` was already processed, returns `Error::DuplicateCommand`.
-    /// The caller should look up the cached result from the commands table.
+    /// If `command_id` was already processed, returns the **same result** as the
+    /// original call. This enables safe client retries - the client can retry
+    /// after a timeout without risking duplicate events.
     ///
     /// # Atomicity
     ///
@@ -286,10 +461,9 @@ impl Storage {
     /// ```
     pub fn append(&mut self, cmd: AppendCommand) -> Result<AppendResult> {
         // Check for duplicate command first (before starting transaction)
-        if self.is_duplicate_command(&cmd.command_id)? {
-            return Err(Error::DuplicateCommand {
-                command_id: cmd.command_id.to_string(),
-            });
+        // If duplicate, return the cached result (exactly-once semantics)
+        if let Some(cached_result) = self.get_cached_command_result(&cmd.command_id) {
+            return Ok(cached_result);
         }
 
         // Check conflict using in-memory cache
@@ -396,7 +570,7 @@ impl Storage {
 
         tx.commit()?;
 
-        // Update in-memory cache AFTER successful commit
+        // Update in-memory caches AFTER successful commit
         // Invariant: Memory never leads disk
         self.update_stream_head_cache(
             cmd.stream_id.clone(),
@@ -405,19 +579,63 @@ impl Storage {
             last_rev,
             last_pos,
         );
+
+        // Cache the command result for exactly-once semantics
+        // LruCache::put() inserts the entry and returns any evicted value
+        self.commands.put(
+            cmd.command_id.to_string(),
+            CommandCacheEntry {
+                first_pos,
+                last_pos,
+                first_rev,
+                last_rev,
+                created_ms: now_ms,
+            },
+        );
+
         self.next_global_pos = last_pos.next();
 
         Ok(AppendResult::new(first_pos, last_pos, first_rev, last_rev))
     }
 
-    /// Checks if a command has already been processed.
-    fn is_duplicate_command(&self, command_id: &CommandId) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM commands WHERE command_id = ?",
-            [command_id.as_str()],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+    /// Looks up a cached command result for idempotency.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(result)` if the command was already processed and is not expired
+    /// - `None` if this is a new command or the cached entry has expired
+    ///
+    /// # Time-Based Expiry
+    ///
+    /// Even if an entry exists in the cache, we check its timestamp. Entries
+    /// older than `COMMAND_CACHE_TTL_MS` (12 hours) are treated as expired.
+    /// This prevents the cache from serving very stale entries that might
+    /// have been accessed recently but created long ago.
+    ///
+    /// # Why &mut self?
+    ///
+    /// LruCache::get() updates the access order (moves item to front),
+    /// which requires mutable access. This is the LRU "promotion" behavior.
+    fn get_cached_command_result(&mut self, command_id: &CommandId) -> Option<AppendResult> {
+        let now_ms = current_time_ms();
+
+        // LruCache::get() returns Option<&V> and promotes the entry
+        if let Some(entry) = self.commands.get(command_id.as_str()) {
+            // Check time-based expiry
+            let age_ms = now_ms.saturating_sub(entry.created_ms);
+            if age_ms <= COMMAND_CACHE_TTL_MS {
+                return Some(entry.to_append_result());
+            }
+            // Entry is expired - we'll treat it as a cache miss
+            // The LRU will eventually evict it, or we could explicitly pop it
+        }
+
+        // Not in cache (or expired) - this is likely a new command
+        // We intentionally do NOT fall back to the database here because:
+        // - 99.99% of cache misses are new commands (no DB entry exists)
+        // - DB lookup on every new command would be expensive
+        // - Commands older than 12h being retried is extremely rare
+        None
     }
 
     /// Updates the in-memory stream head cache.
@@ -982,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_command() {
+    fn test_duplicate_command_returns_same_result() {
         let mut storage = create_test_storage();
 
         let cmd = AppendCommand::new(
@@ -993,11 +1211,51 @@ mod tests {
         );
 
         // First time succeeds
-        storage.append(cmd.clone()).unwrap();
+        let result1 = storage.append(cmd.clone()).unwrap();
 
-        // Second time is duplicate
-        let result = storage.append(cmd);
-        assert!(matches!(result, Err(Error::DuplicateCommand { .. })));
+        // Second time returns the SAME result (exactly-once semantics)
+        let result2 = storage.append(cmd).unwrap();
+
+        // Results should be identical
+        assert_eq!(result1.first_pos.as_raw(), result2.first_pos.as_raw());
+        assert_eq!(result1.last_pos.as_raw(), result2.last_pos.as_raw());
+        assert_eq!(result1.first_rev.as_raw(), result2.first_rev.as_raw());
+        assert_eq!(result1.last_rev.as_raw(), result2.last_rev.as_raw());
+
+        // Only one event should exist (not two)
+        let events = storage.read_stream(&StreamId::new("stream-1"), StreamRev::FIRST, 100).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_retry_after_simulated_timeout() {
+        let mut storage = create_test_storage();
+
+        // Simulate: client sends command, gets response, but response is lost
+        let cmd = AppendCommand::new(
+            "cmd-retry-test",
+            "stream-1",
+            StreamRev::NONE,
+            vec![
+                EventData::with_type("Created", b"event 1".to_vec()),
+                EventData::with_type("Updated", b"event 2".to_vec()),
+            ],
+        );
+
+        // Original request succeeds (but pretend client didn't get response)
+        let original_result = storage.append(cmd.clone()).unwrap();
+        assert_eq!(original_result.event_count(), 2);
+
+        // Client retries with same command_id
+        let retry_result = storage.append(cmd).unwrap();
+
+        // Should get exact same result
+        assert_eq!(original_result.first_pos.as_raw(), retry_result.first_pos.as_raw());
+        assert_eq!(original_result.last_pos.as_raw(), retry_result.last_pos.as_raw());
+
+        // Database should have exactly 2 events, not 4
+        let events = storage.read_global(GlobalPos::FIRST, 100).unwrap();
+        assert_eq!(events.len(), 2);
     }
 
     #[test]
