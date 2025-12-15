@@ -79,11 +79,12 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use rusqlite::{params, Connection};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::codec::{compute_checksum, current_time_ms, encode_batch, CIPHER_NONE, CODEC_NONE};
 use crate::error::{Error, Result};
+use crate::subscription::{BroadcastEvent, SubscriptionManager, DEFAULT_BROADCAST_CAPACITY};
 use crate::types::{
     AppendCommand, AppendResult, CollisionSlot, CommandCacheEntry, CommandId, GlobalPos,
     StreamHash, StreamHeadEntry, StreamId, StreamRev, COMMAND_CACHE_MAX_ENTRIES,
@@ -135,6 +136,14 @@ impl Default for WriterConfig {
 // Request Types
 // =============================================================================
 
+/// Response for a subscription request.
+pub struct SubscriptionResponse {
+    /// Broadcast receiver for live events.
+    pub receiver: broadcast::Receiver<BroadcastEvent>,
+    /// Current head position (last committed global_pos).
+    pub head_pos: GlobalPos,
+}
+
 /// A write request sent to the batch writer.
 pub enum WriteRequest {
     /// Single append command.
@@ -147,6 +156,14 @@ pub enum WriteRequest {
     Transaction {
         commands: Vec<AppendCommand>,
         response: oneshot::Sender<Result<Vec<Result<AppendResult>>>>,
+    },
+
+    /// Subscribe to live events.
+    ///
+    /// Returns a broadcast receiver and the current head position.
+    /// The subscriber will receive all events committed after this point.
+    Subscribe {
+        response: oneshot::Sender<SubscriptionResponse>,
     },
 
     /// Shutdown the writer.
@@ -205,6 +222,10 @@ struct StagedState {
 
     /// Next global position to assign.
     next_pos: GlobalPos,
+
+    /// Events written in this batch (for broadcasting after commit).
+    /// These are cleared after commit or rollback.
+    events_to_broadcast: Vec<BroadcastEvent>,
 }
 
 impl StagedState {
@@ -212,12 +233,14 @@ impl StagedState {
         Self {
             heads: HashMap::new(),
             next_pos,
+            events_to_broadcast: Vec::new(),
         }
     }
 
     fn clear(&mut self, next_pos: GlobalPos) {
         self.heads.clear();
         self.next_pos = next_pos;
+        self.events_to_broadcast.clear();
     }
 }
 
@@ -245,6 +268,12 @@ pub struct BatchWriter {
     /// Command cache for idempotency.
     commands: LruCache<String, CommandCacheEntry>,
 
+    /// Subscription manager for broadcasting events to subscribers.
+    ///
+    /// After each successful batch commit, events are broadcast to all
+    /// active subscribers via this manager's broadcast channel.
+    subscription_manager: SubscriptionManager,
+
     /// Configuration (stored for potential future use like dynamic reconfiguration).
     #[allow(dead_code)]
     config: WriterConfig,
@@ -258,6 +287,21 @@ impl BatchWriter {
     /// * `conn` - SQLite connection (schema must be initialized)
     /// * `config` - Writer configuration
     pub fn new(conn: Connection, config: WriterConfig) -> Result<Self> {
+        Self::new_with_broadcast_capacity(conn, config, DEFAULT_BROADCAST_CAPACITY)
+    }
+
+    /// Creates a new batch writer with custom broadcast channel capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `conn` - SQLite connection (schema must be initialized)
+    /// * `config` - Writer configuration
+    /// * `broadcast_capacity` - Size of the broadcast channel for subscriptions
+    pub fn new_with_broadcast_capacity(
+        conn: Connection,
+        config: WriterConfig,
+        broadcast_capacity: usize,
+    ) -> Result<Self> {
         let cache_capacity = NonZeroUsize::new(COMMAND_CACHE_MAX_ENTRIES)
             .expect("COMMAND_CACHE_MAX_ENTRIES must be > 0");
 
@@ -267,6 +311,7 @@ impl BatchWriter {
             staged: StagedState::new(GlobalPos::FIRST),
             next_pos_committed: GlobalPos::FIRST,
             commands: LruCache::new(cache_capacity),
+            subscription_manager: SubscriptionManager::new(broadcast_capacity),
             config,
         };
 
@@ -278,6 +323,23 @@ impl BatchWriter {
         writer.staged = StagedState::new(writer.next_pos_committed);
 
         Ok(writer)
+    }
+
+    /// Returns a broadcast receiver for subscribing to live events.
+    ///
+    /// The receiver will receive all events committed after this point.
+    pub fn subscribe(&self) -> broadcast::Receiver<BroadcastEvent> {
+        self.subscription_manager.subscribe()
+    }
+
+    /// Returns the current head position (last committed global_pos).
+    pub fn head_pos(&self) -> GlobalPos {
+        self.subscription_manager.head_pos()
+    }
+
+    /// Returns the number of active subscribers.
+    pub fn subscriber_count(&self) -> usize {
+        self.subscription_manager.subscriber_count()
     }
 
     /// Loads stream heads from database.
@@ -662,10 +724,10 @@ impl BatchWriter {
 
         let batch_id = self.conn.last_insert_rowid();
 
-        // Insert event index entries
+        // Insert event index entries and build broadcast events
         let mut rev = first_rev;
         let mut pos = first_pos;
-        for (offset, len) in &event_offsets {
+        for (i, (offset, len)) in event_offsets.iter().enumerate() {
             self.conn.execute(
                 "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, collision_slot, stream_rev)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -679,6 +741,16 @@ impl BatchWriter {
                     rev.as_raw() as i64,
                 ],
             )?;
+
+            // Stage event for broadcasting after commit
+            self.staged.events_to_broadcast.push(BroadcastEvent::new(
+                pos,
+                cmd.stream_id.clone(),
+                rev,
+                now_ms,
+                cmd.events[i].data.clone(),
+            ));
+
             pos = pos.next();
             rev = rev.next();
         }
@@ -740,6 +812,11 @@ impl BatchWriter {
     }
 
     /// Commits staged state to committed state.
+    ///
+    /// This:
+    /// 1. Updates committed position counter
+    /// 2. Merges staged stream heads into committed state
+    /// 3. Broadcasts all staged events to subscribers
     fn commit_staged_state(&mut self) {
         // Update committed position
         self.next_pos_committed = self.staged.next_pos;
@@ -755,6 +832,13 @@ impl BatchWriter {
             } else {
                 entries.push(entry);
             }
+        }
+
+        // Broadcast events to all subscribers
+        // Take the events out of staged state
+        let events = std::mem::take(&mut self.staged.events_to_broadcast);
+        if !events.is_empty() {
+            self.subscription_manager.broadcast_events(events);
         }
     }
 }
@@ -823,6 +907,51 @@ impl BatchWriterHandle {
         response_rx
             .await
             .map_err(|_| Error::Schema("writer dropped response".to_string()))?
+    }
+
+    /// Subscribes to live events.
+    ///
+    /// Returns a broadcast receiver that will receive all events committed
+    /// after this point, along with the current head position.
+    ///
+    /// # Catch-Up Pattern
+    ///
+    /// To receive events from a specific historical position:
+    /// 1. Call `subscribe()` to get the receiver and current head position
+    /// 2. Read historical events from `head_pos` to your start position
+    /// 3. Start receiving from the broadcast receiver
+    /// 4. Filter out events you already read during catch-up
+    ///
+    /// See `CatchUpSubscription` for a higher-level API that handles this.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let response = writer.subscribe().await?;
+    /// println!("Current head: {}", response.head_pos);
+    ///
+    /// // Now receive live events
+    /// loop {
+    ///     match response.receiver.recv().await {
+    ///         Ok(event) => println!("Event: {:?}", event),
+    ///         Err(RecvError::Lagged(n)) => eprintln!("Missed {} events", n),
+    ///         Err(RecvError::Closed) => break,
+    ///     }
+    /// }
+    /// ```
+    pub async fn subscribe(&self) -> Result<SubscriptionResponse> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.tx
+            .send(WriteRequest::Subscribe {
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| Error::Schema("writer has shut down".to_string()))?;
+
+        response_rx
+            .await
+            .map_err(|_| Error::Schema("writer dropped response".to_string()))
     }
 }
 
@@ -925,6 +1054,13 @@ pub async fn run_batch_writer(
                     writer.execute_batch(std::mem::take(&mut batch));
                     batch_start = None;
                 }
+            }
+            Ok(Some(WriteRequest::Subscribe { response })) => {
+                // Subscribe requests are handled immediately (not batched)
+                // This ensures the subscriber gets the accurate current head position
+                let receiver = writer.subscribe();
+                let head_pos = writer.head_pos();
+                let _ = response.send(SubscriptionResponse { receiver, head_pos });
             }
             Ok(Some(WriteRequest::Shutdown)) => {
                 // Execute any remaining batch before shutdown

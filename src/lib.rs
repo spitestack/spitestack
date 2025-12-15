@@ -117,6 +117,21 @@ pub mod api;
 /// - Staged/committed state separation for memory safety
 pub mod writer;
 
+/// Subscriptions and live tailing.
+///
+/// This module implements real-time event subscriptions. Subscribers can
+/// receive events as they're committed, starting from any historical position.
+///
+/// Key features:
+/// - Live event streaming via broadcast channel
+/// - Catch-up from historical position then seamless switch to live
+/// - Stream filtering (subscribe to specific streams)
+/// - Backpressure handling for slow subscribers
+///
+/// See [`subscription::SimpleSubscription`] for basic live subscriptions and
+/// [`subscription::CatchUpSubscription`] for catch-up + live pattern.
+pub mod subscription;
+
 // =============================================================================
 // Re-exports
 // =============================================================================
@@ -132,4 +147,10 @@ pub use writer::{BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batc
 pub use types::{
     AppendCommand, AppendResult, CollisionSlot, CommandId, Event, EventData, GlobalPos,
     StreamHash, StreamId, StreamRev,
+};
+
+// Re-export subscription types
+pub use subscription::{
+    BroadcastEvent, CatchUpSubscription, SimpleSubscription, SubscriptionBuilder,
+    SubscriptionManager,
 };

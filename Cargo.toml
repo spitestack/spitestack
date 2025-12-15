@@ -65,6 +65,15 @@ lru = "0.12"
 # - spawn_blocking() for running SQLite operations without blocking the runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 
+# =============================================================================
+# Async Streams
+# =============================================================================
+# futures: Foundation for async programming in Rust
+# - Provides the Stream trait for async iterators
+# - Used by subscriptions to implement the Stream interface
+# - Core abstraction for async sequences of values
+futures = "0.3"
+
 [dev-dependencies]
 # tempfile: Create temporary files/directories for testing
 # - Automatically cleaned up when TempDir goes out of scope

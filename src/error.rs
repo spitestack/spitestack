@@ -204,6 +204,41 @@ pub enum Error {
         /// The actual current epoch
         current: u64,
     },
+
+    // =========================================================================
+    // Subscription Errors
+    // =========================================================================
+
+    /// Subscription fell behind and missed events.
+    ///
+    /// # When This Happens
+    ///
+    /// The broadcast channel has a bounded capacity. If a subscriber can't keep
+    /// up with the rate of events being published, older events get dropped to
+    /// make room for new ones. The subscriber receives this error indicating
+    /// how many events were missed.
+    ///
+    /// # Systems Concept: Backpressure
+    ///
+    /// In streaming systems, producers and consumers may operate at different
+    /// speeds. Backpressure mechanisms prevent unbounded memory growth:
+    /// - **Bounded buffers**: Fixed-size queues that drop oldest items
+    /// - **Flow control**: Slow down producers when consumers lag
+    /// - **Lossy**: Accept some data loss (our approach for subscriptions)
+    ///
+    /// We chose lossy because:
+    /// - Subscribers can catch up by re-reading from the database
+    /// - It keeps memory bounded regardless of subscriber speed
+    /// - Fast subscribers aren't penalized by slow ones
+    ///
+    /// # Recovery
+    ///
+    /// The subscriber should:
+    /// 1. Note the last successfully received position
+    /// 2. Create a new subscription from that position
+    /// 3. The new subscription will catch up from the database
+    #[error("subscription lagged: missed {0} events")]
+    SubscriptionLagged(u64),
 }
 
 // =============================================================================
