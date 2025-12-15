@@ -49,6 +49,22 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # - Prevents unbounded memory growth from stored command results
 lru = "0.12"
 
+# =============================================================================
+# Async Runtime
+# =============================================================================
+# tokio: The most widely-used async runtime for Rust
+# Features enabled:
+# - rt-multi-thread: Multi-threaded runtime with work-stealing scheduler
+# - sync: Async-aware synchronization primitives (mpsc, oneshot, etc.)
+# - macros: #[tokio::main] and #[tokio::test] macros
+# - time: Timers, delays, and timeouts (needed for group commit in Stage 7)
+#
+# Why Tokio?
+# - Industry standard, battle-tested in production
+# - Excellent documentation and ecosystem
+# - spawn_blocking() for running SQLite operations without blocking the runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+
 [dev-dependencies]
 # tempfile: Create temporary files/directories for testing
 # - Automatically cleaned up when TempDir goes out of scope

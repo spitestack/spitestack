@@ -87,12 +87,32 @@ pub mod types;
 /// and maintains an in-memory cache of stream heads.
 pub mod storage;
 
+/// Actor-based concurrency layer (synchronous).
+///
+/// This module provides thread-safe access to storage via the actor pattern.
+/// The `StorageActor` runs on a dedicated thread and processes requests
+/// via message passing, enforcing the single-writer invariant.
+///
+/// For async usage, see the [`api`] module instead.
+pub mod actor;
+
+/// Async API for SpiteDB.
+///
+/// This module provides the public async interface using Tokio. It wraps the
+/// synchronous storage layer with async primitives, enabling non-blocking
+/// usage from async applications.
+///
+/// The main entry point is [`SpiteDB`](api::SpiteDB).
+pub mod api;
+
 // =============================================================================
 // Re-exports
 // =============================================================================
 // Rust pattern: Re-export commonly used types at the crate root for convenience.
 // Users can write `use spitedb::Error` instead of `use spitedb::error::Error`.
 
+pub use actor::{ReadPool, StorageActor, StorageHandle, WriteActor};
+pub use api::SpiteDB;
 pub use error::{Error, Result};
 pub use schema::Database;
 pub use storage::Storage;

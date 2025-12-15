@@ -552,6 +552,34 @@ impl Database {
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
+
+    /// Consumes the Database and returns the underlying SQLite connection.
+    ///
+    /// # Rust Pattern: into_* Methods
+    ///
+    /// Methods starting with `into_` conventionally consume `self` and return
+    /// a transformed value. The original type is destroyed (moved into the result).
+    ///
+    /// This pattern signals "I'm done with the wrapper, give me the inner value."
+    ///
+    /// # Use Case: Storage Initialization
+    ///
+    /// After opening a database, you typically want to create a `Storage` instance:
+    ///
+    /// ```rust,ignore
+    /// let db = Database::open("path/to/db")?;
+    /// let storage = Storage::new(db.into_connection())?;
+    /// // db is now consumed - can't use it anymore
+    /// ```
+    ///
+    /// # Ownership Transfer
+    ///
+    /// The `Connection` is moved out of `Database`. The `Database` struct is
+    /// consumed and can no longer be used. This ensures there's only ever one
+    /// owner of the connection.
+    pub fn into_connection(self) -> Connection {
+        self.conn
+    }
 }
 
 // =============================================================================
