@@ -128,6 +128,7 @@ impl BroadcastEvent {
         Event {
             global_pos: self.global_pos,
             stream_id: self.stream_id,
+            tenant_hash: self.tenant_hash,
             stream_rev: self.stream_rev,
             timestamp_ms: self.timestamp_ms,
             data: (*self.data).clone(),
@@ -140,7 +141,7 @@ impl From<Event> for BroadcastEvent {
         Self::new(
             event.global_pos,
             event.stream_id,
-            TenantHash::default_hash(),
+            event.tenant_hash,
             event.stream_rev,
             event.timestamp_ms,
             event.data,
@@ -973,6 +974,7 @@ mod tests {
         let event = Event {
             global_pos: GlobalPos::from_raw(42),
             stream_id: StreamId::new("test-stream"),
+            tenant_hash: TenantHash::default_hash(),
             stream_rev: StreamRev::from_raw(1),
             timestamp_ms: 12345,
             data: b"hello".to_vec(),

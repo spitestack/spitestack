@@ -603,6 +603,9 @@ pub struct Event {
     /// The stream this event belongs to.
     pub stream_id: StreamId,
 
+    /// The tenant this event belongs to (hashed).
+    pub tenant_hash: TenantHash,
+
     /// Revision within the stream.
     pub stream_rev: StreamRev,
 
@@ -809,6 +812,153 @@ impl CommandCacheEntry {
     pub fn to_append_result(&self) -> AppendResult {
         AppendResult::new(self.first_pos, self.last_pos, self.first_rev, self.last_rev)
     }
+}
+
+// =============================================================================
+// Tombstone Types (GDPR Deletion)
+// =============================================================================
+
+/// Command to delete events from a stream (create tombstone).
+///
+/// # GDPR Compliance
+///
+/// This command creates a tombstone record that marks events as logically deleted.
+/// Events in the tombstoned range are immediately filtered from all reads.
+///
+/// # Idempotency
+///
+/// Like append commands, delete commands use a `command_id` for idempotency.
+/// Retrying the same delete command returns the original result.
+#[derive(Debug, Clone)]
+pub struct DeleteStreamCommand {
+    /// Unique identifier for idempotency.
+    pub command_id: CommandId,
+
+    /// The stream to delete events from.
+    pub stream_id: StreamId,
+
+    /// First revision to delete (inclusive). None = from the beginning.
+    pub from_rev: Option<StreamRev>,
+
+    /// Last revision to delete (inclusive). None = to the current head.
+    pub to_rev: Option<StreamRev>,
+}
+
+impl DeleteStreamCommand {
+    /// Creates a command to delete all events from a stream.
+    pub fn delete_all(command_id: impl Into<CommandId>, stream_id: impl Into<StreamId>) -> Self {
+        Self {
+            command_id: command_id.into(),
+            stream_id: stream_id.into(),
+            from_rev: None,
+            to_rev: None,
+        }
+    }
+
+    /// Creates a command to delete a range of events from a stream.
+    pub fn delete_range(
+        command_id: impl Into<CommandId>,
+        stream_id: impl Into<StreamId>,
+        from_rev: StreamRev,
+        to_rev: StreamRev,
+    ) -> Self {
+        Self {
+            command_id: command_id.into(),
+            stream_id: stream_id.into(),
+            from_rev: Some(from_rev),
+            to_rev: Some(to_rev),
+        }
+    }
+}
+
+/// Command to delete all events for a tenant.
+///
+/// # GDPR "Right to be Forgotten"
+///
+/// When an entire organization requests data deletion, this command marks
+/// the tenant as deleted. All events belonging to that tenant are immediately
+/// filtered from all reads.
+#[derive(Debug, Clone)]
+pub struct DeleteTenantCommand {
+    /// Unique identifier for idempotency.
+    pub command_id: CommandId,
+
+    /// The tenant to delete.
+    pub tenant: Tenant,
+}
+
+impl DeleteTenantCommand {
+    /// Creates a new tenant delete command.
+    pub fn new(command_id: impl Into<CommandId>, tenant: impl Into<Tenant>) -> Self {
+        Self {
+            command_id: command_id.into(),
+            tenant: tenant.into(),
+        }
+    }
+}
+
+/// Result of a successful stream delete operation.
+#[derive(Debug, Clone)]
+pub struct DeleteStreamResult {
+    /// The stream that was deleted from.
+    pub stream_id: StreamId,
+
+    /// First revision that was tombstoned.
+    pub from_rev: StreamRev,
+
+    /// Last revision that was tombstoned.
+    pub to_rev: StreamRev,
+
+    /// When the deletion was recorded (Unix milliseconds).
+    pub deleted_ms: u64,
+}
+
+/// Result of a successful tenant delete operation.
+#[derive(Debug, Clone)]
+pub struct DeleteTenantResult {
+    /// The hash of the deleted tenant.
+    pub tenant_hash: TenantHash,
+
+    /// When the deletion was recorded (Unix milliseconds).
+    pub deleted_ms: u64,
+}
+
+/// A tombstone record marking deleted stream events.
+///
+/// Used internally for filtering events during reads.
+#[derive(Debug, Clone)]
+pub struct StreamTombstone {
+    /// Hash of the stream.
+    pub stream_hash: StreamHash,
+
+    /// Collision slot (matches event_index).
+    pub collision_slot: CollisionSlot,
+
+    /// First revision that is tombstoned (inclusive).
+    pub from_rev: StreamRev,
+
+    /// Last revision that is tombstoned (inclusive).
+    pub to_rev: StreamRev,
+
+    /// When the deletion was recorded.
+    pub deleted_ms: u64,
+}
+
+impl StreamTombstone {
+    /// Checks if a given revision falls within this tombstone's range.
+    pub fn contains(&self, rev: StreamRev) -> bool {
+        rev.as_raw() >= self.from_rev.as_raw() && rev.as_raw() <= self.to_rev.as_raw()
+    }
+}
+
+/// A tombstone record marking a deleted tenant.
+#[derive(Debug, Clone)]
+pub struct TenantTombstone {
+    /// Hash of the deleted tenant.
+    pub tenant_hash: TenantHash,
+
+    /// When the deletion was recorded.
+    pub deleted_ms: u64,
 }
 
 // =============================================================================

@@ -80,7 +80,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::{Error, Result};
 use crate::reader::{self, ReadRequest};
 use crate::schema::Database;
-use crate::types::{AppendCommand, AppendResult, Event, GlobalPos, StreamId, StreamRev};
+use crate::types::{
+    AppendCommand, AppendResult, CommandId, DeleteStreamCommand, DeleteStreamResult,
+    DeleteTenantCommand, DeleteTenantResult, Event, GlobalPos, StreamId, StreamRev, Tenant,
+};
 use crate::writer::{BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer};
 
 // =============================================================================
@@ -591,6 +594,100 @@ impl SpiteDB {
         self.subscribe_stream(stream_id).await
     }
 
+    // =========================================================================
+    // Deletion (GDPR Compliance)
+    // =========================================================================
+
+    /// Deletes all events from a stream.
+    ///
+    /// # GDPR Compliance
+    ///
+    /// Creates a tombstone record that immediately filters all events in the
+    /// stream from reads. Physical deletion happens during offline compaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `command_id` - Unique ID for idempotency (safe to retry)
+    /// * `stream_id` - The stream to delete
+    ///
+    /// # Returns
+    ///
+    /// The tombstone information (revision range deleted, timestamp).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream doesn't exist.
+    pub async fn delete_stream(
+        &self,
+        command_id: impl Into<CommandId>,
+        stream_id: impl Into<StreamId>,
+    ) -> Result<DeleteStreamResult> {
+        let command = DeleteStreamCommand::delete_all(command_id, stream_id);
+        self.writer.delete_stream(command).await
+    }
+
+    /// Deletes a range of events from a stream.
+    ///
+    /// # GDPR Compliance
+    ///
+    /// Creates a tombstone record for the specified revision range. Events in
+    /// that range are immediately filtered from all reads.
+    ///
+    /// # Arguments
+    ///
+    /// * `command_id` - Unique ID for idempotency (safe to retry)
+    /// * `stream_id` - The stream to delete from
+    /// * `from_rev` - First revision to delete (inclusive)
+    /// * `to_rev` - Last revision to delete (inclusive)
+    ///
+    /// # Returns
+    ///
+    /// The tombstone information (revision range deleted, timestamp).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream doesn't exist or the revision range
+    /// is invalid.
+    pub async fn delete_stream_range(
+        &self,
+        command_id: impl Into<CommandId>,
+        stream_id: impl Into<StreamId>,
+        from_rev: StreamRev,
+        to_rev: StreamRev,
+    ) -> Result<DeleteStreamResult> {
+        let command = DeleteStreamCommand::delete_range(command_id, stream_id, from_rev, to_rev);
+        self.writer.delete_stream(command).await
+    }
+
+    /// Deletes all events for a tenant.
+    ///
+    /// # GDPR "Right to be Forgotten"
+    ///
+    /// This is the nuclear option for GDPR compliance. All events belonging
+    /// to the specified tenant are immediately filtered from all reads.
+    ///
+    /// # Arguments
+    ///
+    /// * `command_id` - Unique ID for idempotency (safe to retry)
+    /// * `tenant` - The tenant to delete
+    ///
+    /// # Returns
+    ///
+    /// The tombstone information (tenant hash, timestamp).
+    ///
+    /// # Warning
+    ///
+    /// This operation cannot be undone (without database restoration).
+    /// Ensure you have proper authorization before calling this.
+    pub async fn delete_tenant(
+        &self,
+        command_id: impl Into<CommandId>,
+        tenant: impl Into<Tenant>,
+    ) -> Result<DeleteTenantResult> {
+        let command = DeleteTenantCommand::new(command_id, tenant);
+        self.writer.delete_tenant(command).await
+    }
+
     /// Shuts down the database gracefully.
     ///
     /// # Graceful Shutdown
@@ -829,6 +926,170 @@ mod tests {
 
         h1.await.unwrap();
         h2.await.unwrap();
+
+        db.shutdown().await;
+    }
+
+    // =========================================================================
+    // Tombstone / Deletion Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_delete_stream() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("delete_test.db");
+
+        {
+            let _db = Database::open(&db_path).unwrap();
+        }
+
+        let db = SpiteDB::open(&db_path).await.unwrap();
+
+        // Create a stream with events
+        let cmd = AppendCommand::new(
+            "cmd-1",
+            "user-123",
+            StreamRev::NONE,
+            vec![
+                EventData::new(b"event1".to_vec()),
+                EventData::new(b"event2".to_vec()),
+            ],
+        );
+        db.append(cmd).await.unwrap();
+
+        // Verify events exist
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let events = db
+            .read_stream("user-123", StreamRev::FIRST, 100)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+
+        // Delete the stream
+        let result = db.delete_stream("delete-cmd-1", "user-123").await.unwrap();
+        assert_eq!(result.stream_id.as_str(), "user-123");
+
+        // Verify events are filtered out
+        let events_after = db
+            .read_stream("user-123", StreamRev::FIRST, 100)
+            .await
+            .unwrap();
+        assert!(events_after.is_empty(), "events should be filtered after delete");
+
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_stream_range() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("delete_range_test.db");
+
+        {
+            let _db = Database::open(&db_path).unwrap();
+        }
+
+        let db = SpiteDB::open(&db_path).await.unwrap();
+
+        // Create a stream with events
+        let cmd = AppendCommand::new(
+            "cmd-1",
+            "user-456",
+            StreamRev::NONE,
+            vec![
+                EventData::new(b"event1".to_vec()),
+                EventData::new(b"event2".to_vec()),
+                EventData::new(b"event3".to_vec()),
+                EventData::new(b"event4".to_vec()),
+            ],
+        );
+        db.append(cmd).await.unwrap();
+
+        // Wait for WAL sync
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Delete only revisions 2-3
+        let result = db
+            .delete_stream_range(
+                "delete-cmd-2",
+                "user-456",
+                StreamRev::from_raw(2),
+                StreamRev::from_raw(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.from_rev.as_raw(), 2);
+        assert_eq!(result.to_rev.as_raw(), 3);
+
+        // Verify only revisions 1 and 4 remain
+        let events_after = db
+            .read_stream("user-456", StreamRev::FIRST, 100)
+            .await
+            .unwrap();
+        assert_eq!(events_after.len(), 2);
+        assert_eq!(events_after[0].stream_rev.as_raw(), 1);
+        assert_eq!(events_after[1].stream_rev.as_raw(), 4);
+
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_stream_nonexistent() {
+        let db = SpiteDB::open_in_memory().await.unwrap();
+
+        // Try to delete a non-existent stream
+        let result = db.delete_stream("delete-cmd", "nonexistent").await;
+        assert!(result.is_err());
+
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_tenant() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("delete_tenant_test.db");
+
+        {
+            let _db = Database::open(&db_path).unwrap();
+        }
+
+        let db = SpiteDB::open(&db_path).await.unwrap();
+
+        // Create streams for a tenant (using default tenant for simplicity)
+        let cmd1 = AppendCommand::new(
+            "cmd-1",
+            "stream-a",
+            StreamRev::NONE,
+            vec![EventData::new(b"event1".to_vec())],
+        );
+        let cmd2 = AppendCommand::new(
+            "cmd-2",
+            "stream-b",
+            StreamRev::NONE,
+            vec![EventData::new(b"event2".to_vec())],
+        );
+        db.append(cmd1).await.unwrap();
+        db.append(cmd2).await.unwrap();
+
+        // Wait for WAL sync
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify events exist
+        let events_before = db.read_global(GlobalPos::FIRST, 100).await.unwrap();
+        assert_eq!(events_before.len(), 2);
+
+        // Delete the default tenant
+        let result = db.delete_tenant("tenant-delete-cmd", "default").await.unwrap();
+        assert!(result.deleted_ms > 0);
+
+        // Verify all events are filtered
+        let events_after = db.read_global(GlobalPos::FIRST, 100).await.unwrap();
+        assert!(events_after.is_empty(), "all tenant events should be filtered");
 
         db.shutdown().await;
     }

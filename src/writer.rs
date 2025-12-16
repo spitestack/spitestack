@@ -86,7 +86,8 @@ use crate::codec::{compute_checksum, current_time_ms, encode_batch, CIPHER_NONE,
 use crate::error::{Error, Result};
 use crate::subscription::{BroadcastEvent, SubscriptionManager, DEFAULT_BROADCAST_CAPACITY};
 use crate::types::{
-    AppendCommand, AppendResult, CollisionSlot, CommandCacheEntry, CommandId, GlobalPos,
+    AppendCommand, AppendResult, CollisionSlot, CommandCacheEntry, CommandId,
+    DeleteStreamCommand, DeleteStreamResult, DeleteTenantCommand, DeleteTenantResult, GlobalPos,
     StreamHash, StreamHeadEntry, StreamId, StreamRev, TenantHash, COMMAND_CACHE_MAX_ENTRIES,
     COMMAND_CACHE_TTL_MS,
 };
@@ -164,6 +165,18 @@ pub enum WriteRequest {
     /// The subscriber will receive all events committed after this point.
     Subscribe {
         response: oneshot::Sender<SubscriptionResponse>,
+    },
+
+    /// Delete events from a stream (create tombstone).
+    DeleteStream {
+        command: DeleteStreamCommand,
+        response: oneshot::Sender<Result<DeleteStreamResult>>,
+    },
+
+    /// Delete all events for a tenant.
+    DeleteTenant {
+        command: DeleteTenantCommand,
+        response: oneshot::Sender<Result<DeleteTenantResult>>,
     },
 
     /// Shutdown the writer.
@@ -848,6 +861,108 @@ impl BatchWriter {
             self.subscription_manager.broadcast_events(events);
         }
     }
+
+    // =========================================================================
+    // Delete Operations (Tombstones)
+    // =========================================================================
+
+    /// Executes a stream delete command (creates tombstone).
+    ///
+    /// Delete commands are processed immediately (not batched) because:
+    /// 1. They're infrequent compared to appends
+    /// 2. Users expect immediate effect
+    /// 3. They don't need group commit optimization
+    pub fn execute_delete_stream(&mut self, cmd: DeleteStreamCommand) -> Result<DeleteStreamResult> {
+        let stream_hash = cmd.stream_id.hash();
+
+        // Get stream head to determine collision slot and current revision
+        let head = self.get_stream_head(&cmd.stream_id);
+
+        let collision_slot = match &head {
+            Some(h) => h.collision_slot,
+            None => {
+                // Stream doesn't exist - nothing to delete
+                return Err(Error::Schema(format!(
+                    "stream '{}' does not exist",
+                    cmd.stream_id
+                )));
+            }
+        };
+
+        let head = head.unwrap();
+
+        // Resolve from_rev and to_rev
+        let from_rev = cmd.from_rev.unwrap_or(StreamRev::FIRST);
+        let to_rev = cmd.to_rev.unwrap_or(head.last_rev);
+
+        // Validate revision range
+        if from_rev.as_raw() > to_rev.as_raw() {
+            return Err(Error::Schema(format!(
+                "invalid revision range: from_rev ({}) > to_rev ({})",
+                from_rev.as_raw(),
+                to_rev.as_raw()
+            )));
+        }
+
+        if to_rev.as_raw() > head.last_rev.as_raw() {
+            return Err(Error::Schema(format!(
+                "to_rev ({}) exceeds stream head ({})",
+                to_rev.as_raw(),
+                head.last_rev.as_raw()
+            )));
+        }
+
+        let now_ms = current_time_ms();
+
+        // Insert tombstone record
+        // Use INSERT to create the tombstone (we allow overlapping tombstones)
+        self.conn.execute(
+            "INSERT INTO tombstones (stream_hash, collision_slot, from_rev, to_rev, deleted_ms)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                stream_hash.as_raw(),
+                collision_slot.as_raw() as i64,
+                from_rev.as_raw() as i64,
+                to_rev.as_raw() as i64,
+                now_ms as i64,
+            ],
+        )?;
+
+        Ok(DeleteStreamResult {
+            stream_id: cmd.stream_id,
+            from_rev,
+            to_rev,
+            deleted_ms: now_ms,
+        })
+    }
+
+    /// Executes a tenant delete command (creates tenant tombstone).
+    pub fn execute_delete_tenant(&mut self, cmd: DeleteTenantCommand) -> Result<DeleteTenantResult> {
+        let tenant_hash = cmd.tenant.hash();
+        let now_ms = current_time_ms();
+
+        // Use INSERT OR IGNORE for idempotency
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tenant_tombstones (tenant_hash, deleted_ms)
+             VALUES (?, ?)",
+            params![tenant_hash.as_raw(), now_ms as i64],
+        )?;
+
+        // If the insert was ignored (already exists), get the existing deleted_ms
+        let deleted_ms: i64 = self
+            .conn
+            .query_row(
+                "SELECT deleted_ms FROM tenant_tombstones WHERE tenant_hash = ?",
+                params![tenant_hash.as_raw()],
+                |row| row.get(0),
+            )
+            .unwrap_or(now_ms as i64);
+
+        Ok(DeleteTenantResult {
+            tenant_hash,
+            deleted_ms: deleted_ms as u64,
+        })
+    }
 }
 
 // =============================================================================
@@ -960,6 +1075,50 @@ impl BatchWriterHandle {
             .await
             .map_err(|_| Error::Schema("writer dropped response".to_string()))
     }
+
+    /// Deletes events from a stream (creates tombstone).
+    ///
+    /// # GDPR Compliance
+    ///
+    /// Creates a tombstone record that immediately filters the specified
+    /// events from all reads. Physical deletion happens during compaction.
+    pub async fn delete_stream(&self, command: DeleteStreamCommand) -> Result<DeleteStreamResult> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.tx
+            .send(WriteRequest::DeleteStream {
+                command,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| Error::Schema("writer has shut down".to_string()))?;
+
+        response_rx
+            .await
+            .map_err(|_| Error::Schema("writer dropped response".to_string()))?
+    }
+
+    /// Deletes all events for a tenant.
+    ///
+    /// # GDPR "Right to be Forgotten"
+    ///
+    /// Creates a tenant tombstone that immediately filters all events
+    /// belonging to that tenant from all reads.
+    pub async fn delete_tenant(&self, command: DeleteTenantCommand) -> Result<DeleteTenantResult> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.tx
+            .send(WriteRequest::DeleteTenant {
+                command,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| Error::Schema("writer has shut down".to_string()))?;
+
+        response_rx
+            .await
+            .map_err(|_| Error::Schema("writer dropped response".to_string()))?
+    }
 }
 
 // =============================================================================
@@ -1068,6 +1227,17 @@ pub async fn run_batch_writer(
                 let receiver = writer.subscribe();
                 let head_pos = writer.head_pos();
                 let _ = response.send(SubscriptionResponse { receiver, head_pos });
+            }
+            Ok(Some(WriteRequest::DeleteStream { command, response })) => {
+                // Delete requests are handled immediately (not batched)
+                // They're infrequent and users expect immediate effect
+                let result = writer.execute_delete_stream(command);
+                let _ = response.send(result);
+            }
+            Ok(Some(WriteRequest::DeleteTenant { command, response })) => {
+                // Delete tenant requests are handled immediately
+                let result = writer.execute_delete_tenant(command);
+                let _ = response.send(result);
             }
             Ok(Some(WriteRequest::Shutdown)) => {
                 // Execute any remaining batch before shutdown

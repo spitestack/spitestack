@@ -132,6 +132,22 @@ pub mod writer;
 /// [`subscription::CatchUpSubscription`] for catch-up + live pattern.
 pub mod subscription;
 
+/// Tombstones for GDPR-compliant deletion.
+///
+/// This module implements logical deletion via tombstones. When events are
+/// "deleted", a tombstone record is created that causes those events to be
+/// filtered from all reads immediately. Physical deletion happens during
+/// offline compaction.
+///
+/// Key features:
+/// - Stream tombstones (delete revision ranges within a stream)
+/// - Tenant tombstones (delete all data for an organization)
+/// - Immediate read filtering (events disappear from reads instantly)
+/// - Deferred physical deletion (compaction job interface)
+///
+/// See [`tombstones::CompactionJob`] for the compaction interface.
+pub mod tombstones;
+
 // =============================================================================
 // Re-exports
 // =============================================================================
@@ -147,6 +163,9 @@ pub use writer::{BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batc
 pub use types::{
     AppendCommand, AppendResult, CollisionSlot, CommandId, Event, EventData, GlobalPos,
     StreamHash, StreamId, StreamRev, Tenant, TenantHash,
+    // Tombstone types
+    DeleteStreamCommand, DeleteStreamResult, DeleteTenantCommand, DeleteTenantResult,
+    StreamTombstone, TenantTombstone,
 };
 
 // Re-export subscription types
@@ -154,3 +173,6 @@ pub use subscription::{
     BroadcastEvent, CatchUpSubscription, SimpleSubscription, SubscriptionBuilder,
     SubscriptionManager,
 };
+
+// Re-export tombstone utilities
+pub use tombstones::{CompactionJob, CompactionStats};

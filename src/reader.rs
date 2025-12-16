@@ -41,7 +41,11 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::codec::decode_event_data;
 use crate::error::Result;
-use crate::types::{Event, GlobalPos, StreamId, StreamRev, TenantHash};
+use crate::tombstones::{
+    filter_stream_events, filter_tenant_events, is_tenant_tombstoned, load_stream_tombstones,
+    load_tenant_tombstones,
+};
+use crate::types::{CollisionSlot, Event, GlobalPos, StreamId, StreamRev, TenantHash};
 
 // =============================================================================
 // Request Types
@@ -102,14 +106,29 @@ pub fn read_stream(
 ) -> Result<Vec<Event>> {
     let stream_hash = stream_id.hash();
 
-    // Get collision slot from stream_heads
-    let collision_slot: i64 = conn
+    // Get collision slot and tenant_hash from stream_heads
+    let head_info: Option<(i64, i64)> = conn
         .query_row(
-            "SELECT collision_slot FROM stream_heads WHERE stream_id = ?",
+            "SELECT collision_slot, tenant_hash FROM stream_heads WHERE stream_id = ?",
             [stream_id.as_str()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .unwrap_or(0);
+        .ok();
+
+    let (collision_slot, tenant_hash) = match head_info {
+        Some((slot, tenant)) => (slot, TenantHash::from_raw(tenant)),
+        None => return Ok(Vec::new()), // Stream doesn't exist
+    };
+
+    let collision_slot_typed = CollisionSlot::from_raw(collision_slot as u16);
+
+    // Check if tenant is tombstoned - if so, return empty
+    if is_tenant_tombstoned(conn, tenant_hash)? {
+        return Ok(Vec::new());
+    }
+
+    // Load tombstones for this stream
+    let tombstones = load_stream_tombstones(conn, stream_hash, collision_slot_typed)?;
 
     let mut stmt = conn.prepare(
         "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev, b.created_ms, b.data
@@ -148,11 +167,15 @@ pub fn read_stream(
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
             stream_id: stream_id.clone(),
+            tenant_hash,
             stream_rev: StreamRev::from_raw(stream_rev as u64),
             timestamp_ms: timestamp_ms as u64,
             data,
         });
     }
+
+    // Filter out tombstoned events
+    let result = filter_stream_events(result, &tombstones);
 
     Ok(result)
 }
@@ -168,11 +191,15 @@ pub fn read_stream(
 /// # Returns
 ///
 /// Events in global position order, across all streams.
+/// Events from tombstoned tenants or tombstoned stream revisions are filtered out.
 pub fn read_global(conn: &Connection, from_pos: GlobalPos, limit: usize) -> Result<Vec<Event>> {
-    // Join with stream_heads to get stream_id from stream_hash
+    // Load tenant tombstones first (usually a small set)
+    let deleted_tenants = load_tenant_tombstones(conn)?;
+
+    // Join with stream_heads to get stream_id and tenant_hash
     let mut stmt = conn.prepare(
         "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev,
-                b.created_ms, b.data, s.stream_id
+                b.created_ms, b.data, s.stream_id, s.tenant_hash, s.collision_slot
          FROM event_index e
          JOIN batches b ON e.batch_id = b.batch_id
          JOIN stream_heads s ON e.stream_hash = s.stream_hash AND e.collision_slot = s.collision_slot
@@ -189,24 +216,34 @@ pub fn read_global(conn: &Connection, from_pos: GlobalPos, limit: usize) -> Resu
         let timestamp_ms: i64 = row.get(4)?;
         let batch_data: Vec<u8> = row.get(5)?;
         let stream_id: String = row.get(6)?;
+        let tenant_hash: i64 = row.get(7)?;
+        let collision_slot: i64 = row.get(8)?;
 
-        Ok((global_pos, byte_offset, byte_len, stream_rev, timestamp_ms, batch_data, stream_id))
+        Ok((global_pos, byte_offset, byte_len, stream_rev, timestamp_ms, batch_data, stream_id, tenant_hash, collision_slot))
     })?;
 
     let mut result = Vec::new();
     for event_data in events {
-        let (global_pos, byte_offset, byte_len, stream_rev, timestamp_ms, batch_data, stream_id) = event_data?;
+        let (global_pos, byte_offset, byte_len, stream_rev, timestamp_ms, batch_data, stream_id, tenant_hash, _collision_slot) = event_data?;
 
         let data = decode_event_data(&batch_data, byte_offset as usize, byte_len as usize);
 
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
             stream_id: StreamId::new(stream_id),
+            tenant_hash: TenantHash::from_raw(tenant_hash),
             stream_rev: StreamRev::from_raw(stream_rev as u64),
             timestamp_ms: timestamp_ms as u64,
             data,
         });
     }
+
+    // Filter tenant tombstones first (fast - just a HashSet lookup)
+    let result = filter_tenant_events(result, &deleted_tenants);
+
+    // For stream tombstones, we use the combined filter function
+    // which caches tombstones per stream
+    let result = crate::tombstones::filter_all_tombstones(conn, result, &deleted_tenants)?;
 
     Ok(result)
 }
@@ -223,6 +260,8 @@ pub fn read_global(conn: &Connection, from_pos: GlobalPos, limit: usize) -> Resu
 /// # Returns
 ///
 /// Events in global position order, filtered by tenant.
+/// Returns empty if the tenant has been tombstoned.
+/// Events from tombstoned stream revisions are filtered out.
 ///
 /// # Note
 ///
@@ -235,6 +274,11 @@ pub fn read_tenant_events(
     from_pos: GlobalPos,
     limit: usize,
 ) -> Result<Vec<Event>> {
+    // Check if tenant is tombstoned - if so, return empty
+    if is_tenant_tombstoned(conn, tenant_hash)? {
+        return Ok(Vec::new());
+    }
+
     let mut stmt = conn.prepare(
         "SELECT e.global_pos, e.byte_offset, e.byte_len, e.stream_rev,
                 b.created_ms, b.data, s.stream_id
@@ -270,11 +314,17 @@ pub fn read_tenant_events(
         result.push(Event {
             global_pos: GlobalPos::from_raw_unchecked(global_pos as u64),
             stream_id: StreamId::new(stream_id),
+            tenant_hash,
             stream_rev: StreamRev::from_raw(stream_rev as u64),
             timestamp_ms: timestamp_ms as u64,
             data,
         });
     }
+
+    // Filter stream tombstones using the combined filter
+    // Note: deleted_tenants is empty since we already checked this tenant isn't tombstoned
+    let empty_deleted_tenants = std::collections::HashSet::new();
+    let result = crate::tombstones::filter_all_tombstones(conn, result, &empty_deleted_tenants)?;
 
     Ok(result)
 }

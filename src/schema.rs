@@ -62,7 +62,12 @@ use crate::{Error, Result};
 ///
 /// For v1, we don't implement migrations - if the version doesn't match,
 /// we return an error. Future versions may add migration support.
-const SCHEMA_VERSION: i32 = 1;
+///
+/// # Version History
+///
+/// - v1: Initial schema
+/// - v2: Added collision_slot to tombstones, added tenant_tombstones table
+const SCHEMA_VERSION: i32 = 2;
 
 // =============================================================================
 // DDL Statements
@@ -304,6 +309,7 @@ CREATE TABLE IF NOT EXISTS commands (
 /// # Columns
 ///
 /// - `stream_hash`: Which stream contains the deleted events
+/// - `collision_slot`: Disambiguator for hash collisions (matches event_index)
 /// - `from_rev`: First revision to delete (inclusive)
 /// - `to_rev`: Last revision to delete (inclusive)
 /// - `deleted_ms`: When the deletion was requested
@@ -315,20 +321,46 @@ CREATE TABLE IF NOT EXISTS commands (
 /// than one row per deleted event.
 const CREATE_TOMBSTONES: &str = r#"
 CREATE TABLE IF NOT EXISTS tombstones (
-    stream_hash INTEGER NOT NULL,
-    from_rev    INTEGER NOT NULL,
-    to_rev      INTEGER NOT NULL,
-    deleted_ms  INTEGER NOT NULL
+    stream_hash    INTEGER NOT NULL,
+    collision_slot INTEGER NOT NULL DEFAULT 0,
+    from_rev       INTEGER NOT NULL,
+    to_rev         INTEGER NOT NULL,
+    deleted_ms     INTEGER NOT NULL
 )
 "#;
 
 /// Index for efficient tombstone lookups during reads.
 ///
 /// When reading a stream, we need to quickly find any tombstones that apply.
-/// This index supports: `WHERE stream_hash = ? AND from_rev <= ? AND to_rev >= ?`
+/// This index supports: `WHERE stream_hash = ? AND collision_slot = ?`
 const CREATE_TOMBSTONES_INDEX: &str = r#"
 CREATE INDEX IF NOT EXISTS tombstones_stream
-ON tombstones(stream_hash, from_rev, to_rev)
+ON tombstones(stream_hash, collision_slot, from_rev, to_rev)
+"#;
+
+/// The `tenant_tombstones` table marks entire tenants for logical deletion.
+///
+/// # GDPR "Right to be Forgotten" for Organizations
+///
+/// When an entire tenant (organization) requests data deletion, we mark the
+/// tenant as deleted. All events belonging to that tenant will be filtered
+/// out on reads.
+///
+/// # Columns
+///
+/// - `tenant_hash`: Hash of the tenant identifier (PRIMARY KEY for uniqueness)
+/// - `deleted_ms`: When the deletion was requested
+///
+/// # Why Separate from Stream Tombstones?
+///
+/// Tenant deletion is simpler: a tenant is either fully deleted or not.
+/// No revision ranges needed. Using a separate table allows for efficient
+/// lookups without scanning stream tombstones.
+const CREATE_TENANT_TOMBSTONES: &str = r#"
+CREATE TABLE IF NOT EXISTS tenant_tombstones (
+    tenant_hash INTEGER PRIMARY KEY,
+    deleted_ms  INTEGER NOT NULL
+)
 "#;
 
 // =============================================================================
@@ -564,6 +596,7 @@ impl Database {
         self.conn.execute_batch(CREATE_TENANT_PROJECTION_CHECKPOINT)?;
         self.conn.execute_batch(CREATE_TOMBSTONES)?;
         self.conn.execute_batch(CREATE_TOMBSTONES_INDEX)?;
+        self.conn.execute_batch(CREATE_TENANT_TOMBSTONES)?;
 
         // =====================================================================
         // Schema Versioning
@@ -687,9 +720,9 @@ mod tests {
             )
             .expect("should query tables");
 
-        // We expect 8 tables: metadata, batches, event_index, stream_heads, commands, tombstones,
-        // tenant_event_index, tenant_projection_checkpoint
-        assert_eq!(count, 8, "expected 8 tables");
+        // We expect 9 tables: metadata, batches, event_index, stream_heads, commands, tombstones,
+        // tenant_event_index, tenant_projection_checkpoint, tenant_tombstones
+        assert_eq!(count, 9, "expected 9 tables");
     }
 
     /// Verify that indexes are created.
@@ -763,9 +796,9 @@ mod tests {
                 )
                 .expect("should query");
 
-            // We expect 8 tables: metadata, batches, event_index, stream_heads, commands, tombstones,
-            // tenant_event_index, tenant_projection_checkpoint
-            assert_eq!(count, 8);
+            // We expect 9 tables: metadata, batches, event_index, stream_heads, commands, tombstones,
+            // tenant_event_index, tenant_projection_checkpoint, tenant_tombstones
+            assert_eq!(count, 9);
         }
     }
 }
