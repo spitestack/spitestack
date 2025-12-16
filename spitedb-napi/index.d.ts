@@ -81,19 +81,34 @@ export declare class SpiteDbNapi {
    * @param commandId - Unique command ID for idempotency
    * @param expectedRev - Expected revision: -1 for "any", 0 for "stream must not exist", >0 for exact revision
    * @param events - Array of event data buffers
+   * @param tenant - Optional tenant ID (defaults to "default" for single-tenant apps)
    */
-  append(streamId: string, commandId: string, expectedRev: number, events: Array<Buffer>): Promise<AppendResultNapi>
+  append(streamId: string, commandId: string, expectedRev: number, events: Array<Buffer>, tenant?: string | undefined | null): Promise<AppendResultNapi>
   /** Reads events from a stream. */
   readStream(streamId: string, fromRev: number, limit: number): Promise<Array<EventNapi>>
   /** Reads events from the global log. */
   readGlobal(fromPos: number, limit: number): Promise<Array<EventNapi>>
   /** Gets the current revision of a stream. */
   getStreamRevision(streamId: string): Promise<number>
-  /** Initializes the projection manager. */
-  initProjections(projectionsPath: string): Promise<void>
-  /** Registers a projection with the given schema. */
+  /**
+   * Initializes the projection registry.
+   *
+   * @param projectionsDir - Directory where projection databases will be stored.
+   *                         Each projection will have its own .db file in this directory.
+   */
+  initProjections(projectionsDir: string): Promise<void>
+  /**
+   * Registers a projection with the given schema.
+   *
+   * Creates the projection's database file at `{projectionsDir}/{name}.db`.
+   */
   registerProjection(name: string, schema: Array<ColumnDefNapi>): Promise<void>
-  /** Reads a row from a projection table by primary key (synchronous). */
+  /**
+   * Reads a row from a projection table by primary key (synchronous for proxy support).
+   *
+   * This method is synchronous because the magic proxy syntax (`table[key]`) requires
+   * synchronous property access. The read uses blocking_lock internally.
+   */
   readProjectionRow(projectionName: string, key: string): string | null
   /** Applies a batch of operations to a projection and updates the checkpoint. */
   applyProjectionBatch(batch: BatchResultNapi): Promise<void>

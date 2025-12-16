@@ -16,7 +16,10 @@ use spitedb::{
 
 mod projection;
 
-pub use projection::*;
+pub use projection::{
+    BatchResult, ColumnDef, ColumnType, OpType, ProjectionError, ProjectionOp,
+    ProjectionRegistry, ProjectionSchema,
+};
 
 // =============================================================================
 // SpiteDB NAPI Wrapper
@@ -26,7 +29,7 @@ pub use projection::*;
 #[napi]
 pub struct SpiteDBNapi {
     inner: Arc<SpiteDB>,
-    projection_manager: Arc<Mutex<Option<ProjectionManager>>>,
+    projection_registry: Arc<Mutex<Option<ProjectionRegistry>>>,
 }
 
 #[napi]
@@ -40,7 +43,7 @@ impl SpiteDBNapi {
 
         Ok(Self {
             inner: Arc::new(db),
-            projection_manager: Arc::new(Mutex::new(None)),
+            projection_registry: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -53,7 +56,7 @@ impl SpiteDBNapi {
 
         Ok(Self {
             inner: Arc::new(db),
-            projection_manager: Arc::new(Mutex::new(None)),
+            projection_registry: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -152,27 +155,33 @@ impl SpiteDBNapi {
         Ok(rev.as_raw() as i64)
     }
 
-    /// Initializes the projection manager.
+    /// Initializes the projection registry.
+    ///
+    /// @param projectionsDir - Directory where projection databases will be stored.
+    ///                         Each projection will have its own .db file in this directory.
     #[napi]
-    pub async fn init_projections(&self, projections_path: String) -> Result<()> {
-        let manager = ProjectionManager::new(&projections_path, self.inner.clone())
-            .map_err(|e| Error::from_reason(format!("Failed to init projections: {}", e)))?;
+    pub async fn init_projections(&self, projections_dir: String) -> Result<()> {
+        let registry =
+            ProjectionRegistry::new(std::path::PathBuf::from(projections_dir), self.inner.clone())
+                .map_err(|e| Error::from_reason(format!("Failed to init projections: {}", e)))?;
 
-        let mut guard = self.projection_manager.lock().await;
-        *guard = Some(manager);
+        let mut guard = self.projection_registry.lock().await;
+        *guard = Some(registry);
 
         Ok(())
     }
 
     /// Registers a projection with the given schema.
+    ///
+    /// Creates the projection's database file at `{projectionsDir}/{name}.db`.
     #[napi]
     pub async fn register_projection(
         &self,
         name: String,
         schema: Vec<ColumnDefNapi>,
     ) -> Result<()> {
-        let mut guard = self.projection_manager.lock().await;
-        let manager = guard.as_mut().ok_or_else(|| {
+        let mut guard = self.projection_registry.lock().await;
+        let registry = guard.as_mut().ok_or_else(|| {
             Error::from_reason("Projections not initialized. Call initProjections() first.")
         })?;
 
@@ -182,27 +191,36 @@ impl SpiteDBNapi {
             columns,
         };
 
-        manager
-            .register_projection(&name, proj_schema)
+        registry
+            .register(&name, proj_schema)
             .map_err(|e| Error::from_reason(format!("Failed to register projection: {}", e)))?;
 
         Ok(())
     }
 
-    /// Reads a row from a projection table by primary key (synchronous).
+    /// Reads a row from a projection table by primary key (synchronous for proxy support).
+    ///
+    /// This method is synchronous because the magic proxy syntax (`table[key]`) requires
+    /// synchronous property access. The read uses blocking_lock internally.
     #[napi]
     pub fn read_projection_row(
         &self,
         projection_name: String,
         key: String,
     ) -> Result<Option<String>> {
-        let guard = self.projection_manager.blocking_lock();
-        let manager = guard
+        let guard = self.projection_registry.blocking_lock();
+        let registry = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Projections not initialized"))?;
 
-        let result = manager
-            .read_row(&projection_name, &key)
+        // Get the consumer and read synchronously
+        let instance = registry
+            .get_instance(&projection_name)
+            .ok_or_else(|| Error::from_reason(format!("Projection '{}' not found", projection_name)))?;
+
+        let inst_guard = instance.blocking_lock();
+        let result = inst_guard
+            .read_row(&key)
             .map_err(|e| Error::from_reason(format!("Read failed: {}", e)))?;
 
         // Return as JSON string
@@ -212,15 +230,20 @@ impl SpiteDBNapi {
     /// Applies a batch of operations to a projection and updates the checkpoint.
     #[napi]
     pub async fn apply_projection_batch(&self, batch: BatchResultNapi) -> Result<()> {
-        let mut guard = self.projection_manager.lock().await;
-        let manager = guard
-            .as_mut()
+        let guard = self.projection_registry.lock().await;
+        let registry = guard
+            .as_ref()
             .ok_or_else(|| Error::from_reason("Projections not initialized"))?;
 
         let result = BatchResult::from(batch);
 
-        manager
-            .apply_batch(result)
+        registry
+            .apply_batch(
+                &result.projection_name,
+                result.operations,
+                result.last_global_pos,
+            )
+            .await
             .map_err(|e| Error::from_reason(format!("Apply batch failed: {}", e)))?;
 
         Ok(())
@@ -233,47 +256,37 @@ impl SpiteDBNapi {
         projection_name: String,
         batch_size: i64,
     ) -> Result<Option<EventBatchNapi>> {
-        let guard = self.projection_manager.lock().await;
-        let manager = guard
+        let guard = self.projection_registry.lock().await;
+        let registry = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Projections not initialized"))?;
 
-        let checkpoint = manager
-            .get_checkpoint(&projection_name)
-            .map_err(|e| Error::from_reason(format!("Failed to get checkpoint: {}", e)))?;
-
-        // Read events from the event store starting after checkpoint
-        let from_pos = checkpoint
-            .map(|p| GlobalPos::from_raw((p + 1) as u64))
-            .unwrap_or(GlobalPos::FIRST);
-
-        let events = self
-            .inner
-            .read_global(from_pos, batch_size as usize)
+        let result = registry
+            .get_events(&projection_name, batch_size as usize)
             .await
-            .map_err(|e| Error::from_reason(format!("Read failed: {}", e)))?;
+            .map_err(|e| Error::from_reason(format!("Failed to get events: {}", e)))?;
 
-        if events.is_empty() {
-            return Ok(None);
+        match result {
+            Some((events, batch_id)) => Ok(Some(EventBatchNapi {
+                projection_name,
+                events: events.into_iter().map(EventNapi::from).collect(),
+                batch_id,
+            })),
+            None => Ok(None),
         }
-
-        Ok(Some(EventBatchNapi {
-            projection_name,
-            events: events.into_iter().map(EventNapi::from).collect(),
-            batch_id: from_pos.as_raw() as i64,
-        }))
     }
 
     /// Gets the current checkpoint for a projection.
     #[napi]
     pub async fn get_projection_checkpoint(&self, projection_name: String) -> Result<Option<i64>> {
-        let guard = self.projection_manager.lock().await;
-        let manager = guard
+        let guard = self.projection_registry.lock().await;
+        let registry = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Projections not initialized"))?;
 
-        manager
+        registry
             .get_checkpoint(&projection_name)
+            .await
             .map_err(|e| Error::from_reason(format!("Failed to get checkpoint: {}", e)))
     }
 }

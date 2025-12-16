@@ -2,19 +2,21 @@
  * SpiteDB Projection System
  *
  * Provides a delightful API for building projections (read models) from event streams.
+ * Each projection runs in its own worker thread for true parallelism.
  *
  * @example
  * ```typescript
- * import { SpiteDB } from '@spitedb/napi';
+ * // projections/user-stats.ts
+ * import { defineProjection } from 'spitedb';
  *
- * const userStats = projection('user_stats', {
+ * export default defineProjection(import.meta.path, {
+ *   name: 'user_stats',
  *   schema: {
  *     user_id: { type: 'text', primaryKey: true },
- *     login_count: { type: 'integer' },
- *     total_spent: { type: 'real' },
+ *     login_count: 'integer',
+ *     total_spent: 'real',
  *   },
- *
- *   async apply(event, table) {
+ *   apply(event, table) {
  *     const data = JSON.parse(event.data.toString());
  *
  *     if (data.type === 'UserCreated') {
@@ -34,13 +36,25 @@
  *     }
  *   }
  * });
+ * ```
  *
- * const db = await SpiteDB.open('events.db');
- * db.registerProjection(userStats);
- * await db.startProjections();
+ * @example
+ * ```typescript
+ * // main.ts
+ * import { ProjectionRunner } from 'spitedb';
+ * import userStats from './projections/user-stats';
+ *
+ * const runner = new ProjectionRunner({
+ *   eventStorePath: './events.db',
+ *   projectionsDir: './projections-data',
+ * });
+ *
+ * await runner.load(userStats);
+ * await runner.startAll();
  * ```
  */
 
+// Types
 export type {
   ColumnDef,
   ColumnType,
@@ -54,52 +68,27 @@ export type {
   SchemaToRow,
 } from './types';
 
+// Define projection helper and branded type (for worker-based projections)
+export { defineProjection, type ProjectionModule, type ProjectionDefinition } from './define';
+
+// Proxy for magic table access
 export { createProjectionProxy } from './proxy';
-export { ProjectionRunner } from './runner';
+
+// Runner for managing projection workers
+export { ProjectionRunner, type RunnerConfig } from './runner';
 
 import type { Projection, ProjectionOptions, SchemaDefinition } from './types';
 
 /**
- * Creates a projection definition.
+ * Creates a projection definition (legacy API).
  *
- * A projection is a read model built from the event stream.
- * The `apply` function is called for each event and can modify
- * the projection table using a magic proxy syntax.
+ * For worker-based projections with true parallelism, use `defineProjection()` instead.
  *
- * @param name - Unique name for the projection (also the table name)
- * @param options - Projection configuration including schema and apply function
- * @returns A projection definition that can be registered with SpiteDB
+ * @param name - Unique name for the projection
+ * @param options - Projection configuration
+ * @returns A projection definition
  *
- * @example
- * ```typescript
- * const orderTotals = projection('order_totals', {
- *   schema: {
- *     order_id: { type: 'text', primaryKey: true },
- *     total: { type: 'real' },
- *     item_count: { type: 'integer' },
- *     status: { type: 'text' },
- *   },
- *
- *   apply(event, table) {
- *     const data = JSON.parse(event.data.toString());
- *
- *     switch (data.type) {
- *       case 'OrderCreated':
- *         table[data.orderId] = { total: 0, item_count: 0, status: 'pending' };
- *         break;
- *
- *       case 'ItemAdded':
- *         table[data.orderId].total += data.price;
- *         table[data.orderId].item_count++;
- *         break;
- *
- *       case 'OrderCompleted':
- *         table[data.orderId].status = 'completed';
- *         break;
- *     }
- *   }
- * });
- * ```
+ * @deprecated Use `defineProjection()` for worker-based projections
  */
 export function projection<TSchema extends SchemaDefinition>(
   name: string,

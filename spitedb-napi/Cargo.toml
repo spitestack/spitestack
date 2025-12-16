@@ -34,5 +34,8 @@ base64 = "0.22"
 [build-dependencies]
 napi-build = "2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 lto = true

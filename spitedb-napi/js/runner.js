@@ -1,219 +1,223 @@
 /**
  * Projection Runner
  *
- * Manages the event processing loop for projections.
- * Fetches batches of events from Rust, runs the user's apply function,
- * and sends operations back to be persisted atomically.
+ * Manages projection workers. Each projection runs in its own Bun Worker thread
+ * with `smol: true` for minimal memory footprint.
+ *
+ * ## Architecture
+ *
+ * ```
+ * Main Thread
+ *     │
+ *     └── ProjectionRunner.load('./projections/user-stats.ts')
+ *             │
+ *             └── spawns Worker with module path
+ *
+ * Worker "user_stats" (smol: true)
+ *     ├── imports projection module
+ *     ├── validates module exports
+ *     ├── loads NAPI bindings
+ *     ├── connects to event store
+ *     ├── owns projection DB (user_stats.db)
+ *     ├── polls for events
+ *     ├── runs apply() function
+ *     └── writes to its own SQLite
+ * ```
+ *
+ * ## Key Benefits
+ *
+ * - **True parallelism**: Each projection runs in its own thread
+ * - **Isolation**: One slow/failing projection doesn't affect others
+ * - **Memory efficient**: smol workers use ~2MB stack instead of 8MB
+ * - **Auto-recovery**: Workers restart on crash with exponential backoff
  */
-import { createProjectionProxy } from './proxy';
+/// <reference types="bun-types" />
+import { Worker } from 'worker_threads';
 /**
- * Converts a schema definition to NAPI column definitions.
- */
-function schemaToColumnDefs(schema) {
-    const columns = [];
-    for (const [name, def] of Object.entries(schema)) {
-        if (typeof def === 'string') {
-            // Simple type definition
-            columns.push({
-                name,
-                colType: def,
-                primaryKey: false,
-                nullable: true,
-                defaultValue: undefined,
-            });
-        }
-        else {
-            // Full definition
-            columns.push({
-                name,
-                colType: def.type,
-                primaryKey: def.primaryKey ?? false,
-                nullable: def.nullable ?? true,
-                defaultValue: def.defaultValue !== undefined
-                    ? JSON.stringify(def.defaultValue)
-                    : undefined,
-            });
-        }
-    }
-    return columns;
-}
-/**
- * Finds the primary key column name from a schema.
- */
-function findPrimaryKey(schema) {
-    for (const [name, def] of Object.entries(schema)) {
-        if (typeof def === 'object' && def.primaryKey) {
-            return name;
-        }
-    }
-    // Default to first column if no explicit primary key
-    return Object.keys(schema)[0];
-}
-/**
- * Converts a NAPI event to a ProjectionEvent.
- */
-function napiEventToProjectionEvent(event) {
-    return {
-        globalPos: BigInt(event.globalPos),
-        streamId: event.streamId,
-        streamRev: BigInt(event.streamRev),
-        timestampMs: BigInt(event.timestampMs),
-        data: event.data,
-    };
-}
-/**
- * Projection runner that manages the event processing loop.
+ * Projection runner that manages worker threads for projections.
+ *
+ * Each projection runs in its own worker thread, providing true parallelism
+ * and isolation. Workers are spawned with `smol: true` for memory efficiency.
+ *
+ * @example
+ * ```typescript
+ * import { ProjectionRunner } from 'spitedb';
+ * import userStats from './projections/user-stats';
+ * import orderTotals from './projections/order-totals';
+ *
+ * const runner = new ProjectionRunner({
+ *   eventStorePath: './events.db',
+ *   projectionsDir: './projections-data',
+ * });
+ *
+ * await runner.load(userStats);
+ * await runner.load(orderTotals);
+ * await runner.startAll();
+ *
+ * // Later, to stop all projections:
+ * runner.stopAll();
+ * ```
  */
 export class ProjectionRunner {
-    native;
-    projections = new Map();
-    initialized = false;
-    constructor(native) {
-        this.native = native;
+    config;
+    workers = new Map();
+    modulePaths = new Set();
+    /**
+     * Creates a new projection runner.
+     *
+     * @param config - Runner configuration including paths
+     */
+    constructor(config) {
+        this.config = config;
     }
     /**
-     * Initializes the projection storage.
-     * Must be called before registering projections.
+     * Loads a projection module.
+     *
+     * The projection must be defined using `defineProjection()` and export default.
+     * This method does not start the worker - call `startAll()` to start processing.
+     *
+     * @param module - The projection module path (from `defineProjection()`)
+     *
+     * @example
+     * ```typescript
+     * import userStats from './projections/user-stats';
+     * await runner.load(userStats);
+     * ```
      */
-    async init(projectionDbPath) {
-        await this.native.initProjections(projectionDbPath);
-        this.initialized = true;
-    }
-    /**
-     * Registers a projection.
-     * Creates the table if it doesn't exist.
-     */
-    async register(name, options) {
-        if (!this.initialized) {
-            throw new Error('ProjectionRunner not initialized. Call init() first.');
+    async load(module) {
+        if (!module || typeof module !== 'string') {
+            throw new Error(`Invalid projection module. Expected a module path from defineProjection().\n\n` +
+                `Usage:\n` +
+                `  // projections/my-projection.ts\n` +
+                `  export default defineProjection(import.meta.path, { ... });\n\n` +
+                `  // main.ts\n` +
+                `  import myProjection from './projections/my-projection';\n` +
+                `  await runner.load(myProjection);`);
         }
-        const columns = schemaToColumnDefs(options.schema);
-        await this.native.registerProjection(name, columns);
-        const primaryKeyColumn = findPrimaryKey(options.schema);
-        this.projections.set(name, {
-            name,
-            options: options,
-            primaryKeyColumn,
-            running: false,
-            abortController: new AbortController(),
-        });
+        this.modulePaths.add(module);
     }
     /**
-     * Starts processing events for all registered projections.
+     * Starts all loaded projections.
+     *
+     * Each projection runs in its own worker thread. Workers that crash will be
+     * automatically restarted with exponential backoff.
      */
     async startAll() {
         const promises = [];
-        for (const state of this.projections.values()) {
-            if (!state.running) {
-                promises.push(this.startProjection(state));
-            }
+        for (const modulePath of this.modulePaths) {
+            promises.push(this.spawnWorker(modulePath));
         }
         await Promise.all(promises);
     }
     /**
-     * Starts processing events for a specific projection.
+     * Spawns a worker for a projection module.
      */
-    async startProjection(state) {
-        state.running = true;
-        state.abortController = new AbortController();
-        const batchSize = state.options.batchSize ?? 100;
-        try {
-            while (state.running) {
-                // Check if aborted
-                if (state.abortController.signal.aborted) {
-                    break;
-                }
-                // Fetch next batch of events
-                const batch = await this.native.getProjectionEvents(state.name, batchSize);
-                if (batch === null) {
-                    // No more events, wait a bit and try again
-                    await sleep(100);
-                    continue;
-                }
-                // Process the batch
-                await this.processBatch(state, batch);
-            }
-        }
-        catch (error) {
-            console.error(`Projection ${state.name} error:`, error);
-            state.running = false;
-            throw error;
-        }
-    }
-    /**
-     * Processes a batch of events.
-     */
-    async processBatch(state, batch) {
-        const { proxy, flush } = createProjectionProxy(state.name, state.primaryKeyColumn, this.native);
-        let lastGlobalPos = batch.batchId;
-        for (const eventNapi of batch.events) {
-            const event = napiEventToProjectionEvent(eventNapi);
-            try {
-                // Run the user's apply function
-                await state.options.apply(event, proxy);
-                lastGlobalPos = eventNapi.globalPos;
-            }
-            catch (error) {
-                // Handle error based on user's strategy
-                const strategy = state.options.onError?.(error, event) ?? 'stop';
-                switch (strategy) {
-                    case 'skip':
-                        // Skip this event and continue
-                        lastGlobalPos = eventNapi.globalPos;
-                        continue;
-                    case 'retry':
-                        // Retry the same event
-                        try {
-                            await state.options.apply(event, proxy);
-                            lastGlobalPos = eventNapi.globalPos;
-                        }
-                        catch {
-                            // If retry fails, stop
-                            throw error;
-                        }
-                        break;
-                    case 'stop':
-                    default:
-                        throw error;
-                }
-            }
-        }
-        // Flush operations and apply to database
-        const operations = flush();
-        const result = {
-            projectionName: state.name,
-            operations: operations.map((op) => ({
-                opType: op.opType,
-                key: op.key,
-                value: op.value,
-            })),
-            lastGlobalPos,
+    async spawnWorker(modulePath) {
+        // Get the path to worker.ts relative to this file
+        const workerPath = new URL('./worker.ts', import.meta.url).pathname;
+        const worker = new Worker(workerPath, {
+            // @ts-expect-error - Bun-specific option for smaller stack size
+            smol: true,
+            workerData: {
+                modulePath,
+                eventStorePath: this.config.eventStorePath,
+                projectionsDir: this.config.projectionsDir,
+            },
+        });
+        const state = {
+            worker,
+            modulePath,
+            restartCount: 0,
+            lastCrash: 0,
+            terminating: false,
         };
-        await this.native.applyProjectionBatch(result);
+        // Handle worker errors
+        worker.on('error', (error) => {
+            if (state.terminating)
+                return;
+            console.error(`[ProjectionRunner] Worker crashed for ${modulePath}:`, error.message);
+            this.handleWorkerCrash(modulePath);
+        });
+        // Handle worker exit
+        worker.on('exit', (code) => {
+            if (state.terminating)
+                return;
+            if (code !== 0) {
+                console.error(`[ProjectionRunner] Worker exited with code ${code} for ${modulePath}`);
+                this.handleWorkerCrash(modulePath);
+            }
+        });
+        this.workers.set(modulePath, state);
     }
     /**
-     * Stops processing for all projections.
+     * Handles a worker crash by restarting with exponential backoff.
+     */
+    async handleWorkerCrash(modulePath) {
+        const state = this.workers.get(modulePath);
+        if (!state || state.terminating)
+            return;
+        const now = Date.now();
+        const timeSinceLastCrash = now - state.lastCrash;
+        // Reset restart count if it's been more than 60 seconds since last crash
+        if (timeSinceLastCrash > 60000) {
+            state.restartCount = 0;
+        }
+        state.restartCount++;
+        state.lastCrash = now;
+        // Exponential backoff: 100ms, 200ms, 400ms, 800ms, ... up to 30s
+        const backoff = Math.min(100 * Math.pow(2, state.restartCount - 1), 30000);
+        console.log(`[ProjectionRunner] Restarting ${modulePath} in ${backoff}ms (attempt ${state.restartCount})`);
+        // Wait for backoff period
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+        // Check if we've been stopped during the backoff
+        if (state.terminating || !this.workers.has(modulePath)) {
+            return;
+        }
+        // Respawn the worker
+        await this.spawnWorker(modulePath);
+    }
+    /**
+     * Stops a specific projection worker.
+     *
+     * @param modulePath - The module path of the projection to stop
+     */
+    stop(modulePath) {
+        const state = this.workers.get(modulePath);
+        if (state) {
+            state.terminating = true;
+            state.worker.terminate();
+            this.workers.delete(modulePath);
+        }
+    }
+    /**
+     * Stops all projection workers.
      */
     stopAll() {
-        for (const state of this.projections.values()) {
-            state.running = false;
-            state.abortController.abort();
+        for (const state of this.workers.values()) {
+            state.terminating = true;
+            state.worker.terminate();
         }
+        this.workers.clear();
     }
     /**
-     * Stops processing for a specific projection.
+     * Returns whether a projection is running.
+     *
+     * @param modulePath - The module path to check
      */
-    stop(name) {
-        const state = this.projections.get(name);
-        if (state) {
-            state.running = false;
-            state.abortController.abort();
-        }
+    isRunning(modulePath) {
+        const state = this.workers.get(modulePath);
+        return state !== undefined && !state.terminating;
     }
-}
-/**
- * Simple sleep helper.
- */
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    /**
+     * Returns the list of loaded projection module paths.
+     */
+    getLoadedModules() {
+        return Array.from(this.modulePaths);
+    }
+    /**
+     * Returns the number of running workers.
+     */
+    getWorkerCount() {
+        return this.workers.size;
+    }
 }
