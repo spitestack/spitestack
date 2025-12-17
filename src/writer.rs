@@ -79,12 +79,12 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use rusqlite::{params, Connection};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::codec::{compute_checksum, current_time_ms, encode_batch, CIPHER_NONE, CODEC_NONE};
+use crate::codec::{compute_checksum, current_time_ms, encode_batch};
+use crate::crypto::{BatchCryptor, CIPHER_AES256GCM, CODEC_ZSTD_L1};
 use crate::error::{Error, Result};
-use crate::subscription::{BroadcastEvent, SubscriptionManager, DEFAULT_BROADCAST_CAPACITY};
 use crate::types::{
     AppendCommand, AppendResult, CollisionSlot, CommandCacheEntry, CommandId,
     DeleteStreamCommand, DeleteStreamResult, DeleteTenantCommand, DeleteTenantResult, GlobalPos,
@@ -137,14 +137,6 @@ impl Default for WriterConfig {
 // Request Types
 // =============================================================================
 
-/// Response for a subscription request.
-pub struct SubscriptionResponse {
-    /// Broadcast receiver for live events.
-    pub receiver: broadcast::Receiver<BroadcastEvent>,
-    /// Current head position (last committed global_pos).
-    pub head_pos: GlobalPos,
-}
-
 /// A write request sent to the batch writer.
 pub enum WriteRequest {
     /// Single append command.
@@ -157,14 +149,6 @@ pub enum WriteRequest {
     Transaction {
         commands: Vec<AppendCommand>,
         response: oneshot::Sender<Result<Vec<Result<AppendResult>>>>,
-    },
-
-    /// Subscribe to live events.
-    ///
-    /// Returns a broadcast receiver and the current head position.
-    /// The subscriber will receive all events committed after this point.
-    Subscribe {
-        response: oneshot::Sender<SubscriptionResponse>,
     },
 
     /// Delete events from a stream (create tombstone).
@@ -235,10 +219,6 @@ struct StagedState {
 
     /// Next global position to assign.
     next_pos: GlobalPos,
-
-    /// Events written in this batch (for broadcasting after commit).
-    /// These are cleared after commit or rollback.
-    events_to_broadcast: Vec<BroadcastEvent>,
 }
 
 impl StagedState {
@@ -246,14 +226,12 @@ impl StagedState {
         Self {
             heads: HashMap::new(),
             next_pos,
-            events_to_broadcast: Vec::new(),
         }
     }
 
     fn clear(&mut self, next_pos: GlobalPos) {
         self.heads.clear();
         self.next_pos = next_pos;
-        self.events_to_broadcast.clear();
     }
 }
 
@@ -269,6 +247,9 @@ pub struct BatchWriter {
     /// SQLite connection (owned, single writer).
     conn: Connection,
 
+    /// Cryptor for compression and encryption.
+    cryptor: BatchCryptor,
+
     /// Committed stream heads (mirrors disk).
     heads_committed: HashMap<StreamHash, Vec<StreamHeadEntry>>,
 
@@ -281,12 +262,6 @@ pub struct BatchWriter {
     /// Command cache for idempotency.
     commands: LruCache<String, CommandCacheEntry>,
 
-    /// Subscription manager for broadcasting events to subscribers.
-    ///
-    /// After each successful batch commit, events are broadcast to all
-    /// active subscribers via this manager's broadcast channel.
-    subscription_manager: SubscriptionManager,
-
     /// Configuration (stored for potential future use like dynamic reconfiguration).
     #[allow(dead_code)]
     config: WriterConfig,
@@ -298,33 +273,19 @@ impl BatchWriter {
     /// # Arguments
     ///
     /// * `conn` - SQLite connection (schema must be initialized)
+    /// * `cryptor` - Cryptor for compression and encryption
     /// * `config` - Writer configuration
-    pub fn new(conn: Connection, config: WriterConfig) -> Result<Self> {
-        Self::new_with_broadcast_capacity(conn, config, DEFAULT_BROADCAST_CAPACITY)
-    }
-
-    /// Creates a new batch writer with custom broadcast channel capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `conn` - SQLite connection (schema must be initialized)
-    /// * `config` - Writer configuration
-    /// * `broadcast_capacity` - Size of the broadcast channel for subscriptions
-    pub fn new_with_broadcast_capacity(
-        conn: Connection,
-        config: WriterConfig,
-        broadcast_capacity: usize,
-    ) -> Result<Self> {
+    pub fn new(conn: Connection, cryptor: BatchCryptor, config: WriterConfig) -> Result<Self> {
         let cache_capacity = NonZeroUsize::new(COMMAND_CACHE_MAX_ENTRIES)
             .expect("COMMAND_CACHE_MAX_ENTRIES must be > 0");
 
         let mut writer = Self {
             conn,
+            cryptor,
             heads_committed: HashMap::new(),
             staged: StagedState::new(GlobalPos::FIRST),
             next_pos_committed: GlobalPos::FIRST,
             commands: LruCache::new(cache_capacity),
-            subscription_manager: SubscriptionManager::new(broadcast_capacity),
             config,
         };
 
@@ -336,23 +297,6 @@ impl BatchWriter {
         writer.staged = StagedState::new(writer.next_pos_committed);
 
         Ok(writer)
-    }
-
-    /// Returns a broadcast receiver for subscribing to live events.
-    ///
-    /// The receiver will receive all events committed after this point.
-    pub fn subscribe(&self) -> broadcast::Receiver<BroadcastEvent> {
-        self.subscription_manager.subscribe()
-    }
-
-    /// Returns the current head position (last committed global_pos).
-    pub fn head_pos(&self) -> GlobalPos {
-        self.subscription_manager.head_pos()
-    }
-
-    /// Returns the number of active subscribers.
-    pub fn subscriber_count(&self) -> usize {
-        self.subscription_manager.subscriber_count()
     }
 
     /// Loads stream heads from database.
@@ -672,7 +616,7 @@ impl BatchWriter {
 
         // Check conflict using staged → committed state
         let current_rev = self.get_current_rev(&cmd.stream_id);
-        if current_rev != cmd.expected_rev {
+        if cmd.expected_rev != StreamRev::ANY && current_rev != cmd.expected_rev {
             return Err(Error::Conflict {
                 stream_id: cmd.stream_id.to_string(),
                 expected: cmd.expected_rev.as_raw(),
@@ -719,20 +663,22 @@ impl BatchWriter {
 
         let now_ms = current_time_ms();
 
-        // Encode events (just raw concatenated payloads)
-        let (batch_data, event_offsets) = encode_batch(&cmd.events);
+        // Encode events (compress and encrypt)
+        let batch_id = first_pos.as_raw() as i64;
+        let (batch_data, nonce, event_offsets) = encode_batch(&cmd.events, batch_id, &self.cryptor)?;
         let checksum = compute_checksum(&batch_data);
 
         // Insert batch
         self.conn.execute(
-            "INSERT INTO batches (base_pos, event_count, created_ms, codec, cipher, checksum, data)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO batches (base_pos, event_count, created_ms, codec, cipher, nonce, checksum, data)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 first_pos.as_raw() as i64,
                 event_count as i64,
                 now_ms as i64,
-                CODEC_NONE,
-                CIPHER_NONE,
+                CODEC_ZSTD_L1,
+                CIPHER_AES256GCM,
+                nonce.as_slice(),
                 checksum.as_slice(),
                 batch_data.as_slice(),
             ],
@@ -740,10 +686,10 @@ impl BatchWriter {
 
         let batch_id = self.conn.last_insert_rowid();
 
-        // Insert event index entries and build broadcast events
+        // Insert event index entries
         let mut rev = first_rev;
         let mut pos = first_pos;
-        for (i, (offset, len)) in event_offsets.iter().enumerate() {
+        for (offset, len) in event_offsets.iter() {
             self.conn.execute(
                 "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len, stream_hash, tenant_hash, collision_slot, stream_rev)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -758,16 +704,6 @@ impl BatchWriter {
                     rev.as_raw() as i64,
                 ],
             )?;
-
-            // Stage event for broadcasting after commit
-            self.staged.events_to_broadcast.push(BroadcastEvent::new(
-                pos,
-                cmd.stream_id.clone(),
-                tenant_hash,
-                rev,
-                now_ms,
-                cmd.events[i].data.clone(),
-            ));
 
             pos = pos.next();
             rev = rev.next();
@@ -852,13 +788,6 @@ impl BatchWriter {
             } else {
                 entries.push(entry);
             }
-        }
-
-        // Broadcast events to all subscribers
-        // Take the events out of staged state
-        let events = std::mem::take(&mut self.staged.events_to_broadcast);
-        if !events.is_empty() {
-            self.subscription_manager.broadcast_events(events);
         }
     }
 
@@ -1031,51 +960,6 @@ impl BatchWriterHandle {
             .map_err(|_| Error::Schema("writer dropped response".to_string()))?
     }
 
-    /// Subscribes to live events.
-    ///
-    /// Returns a broadcast receiver that will receive all events committed
-    /// after this point, along with the current head position.
-    ///
-    /// # Catch-Up Pattern
-    ///
-    /// To receive events from a specific historical position:
-    /// 1. Call `subscribe()` to get the receiver and current head position
-    /// 2. Read historical events from `head_pos` to your start position
-    /// 3. Start receiving from the broadcast receiver
-    /// 4. Filter out events you already read during catch-up
-    ///
-    /// See `CatchUpSubscription` for a higher-level API that handles this.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let response = writer.subscribe().await?;
-    /// println!("Current head: {}", response.head_pos);
-    ///
-    /// // Now receive live events
-    /// loop {
-    ///     match response.receiver.recv().await {
-    ///         Ok(event) => println!("Event: {:?}", event),
-    ///         Err(RecvError::Lagged(n)) => eprintln!("Missed {} events", n),
-    ///         Err(RecvError::Closed) => break,
-    ///     }
-    /// }
-    /// ```
-    pub async fn subscribe(&self) -> Result<SubscriptionResponse> {
-        let (response_tx, response_rx) = oneshot::channel();
-
-        self.tx
-            .send(WriteRequest::Subscribe {
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| Error::Schema("writer has shut down".to_string()))?;
-
-        response_rx
-            .await
-            .map_err(|_| Error::Schema("writer dropped response".to_string()))
-    }
-
     /// Deletes events from a stream (creates tombstone).
     ///
     /// # GDPR Compliance
@@ -1221,13 +1105,6 @@ pub async fn run_batch_writer(
                     batch_start = None;
                 }
             }
-            Ok(Some(WriteRequest::Subscribe { response })) => {
-                // Subscribe requests are handled immediately (not batched)
-                // This ensures the subscriber gets the accurate current head position
-                let receiver = writer.subscribe();
-                let head_pos = writer.head_pos();
-                let _ = response.send(SubscriptionResponse { receiver, head_pos });
-            }
             Ok(Some(WriteRequest::DeleteStream { command, response })) => {
                 // Delete requests are handled immediately (not batched)
                 // They're infrequent and users expect immediate effect
@@ -1267,10 +1144,10 @@ pub async fn run_batch_writer(
 /// Spawns the batch writer on a dedicated thread.
 ///
 /// Returns a handle for submitting commands.
-pub fn spawn_batch_writer(conn: Connection, config: WriterConfig) -> Result<BatchWriterHandle> {
+pub fn spawn_batch_writer(conn: Connection, cryptor: BatchCryptor, config: WriterConfig) -> Result<BatchWriterHandle> {
     let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
 
-    let writer = BatchWriter::new(conn, config.clone())?;
+    let writer = BatchWriter::new(conn, cryptor, config.clone())?;
 
     std::thread::Builder::new()
         .name("spitedb-batch-writer".to_string())
@@ -1294,12 +1171,26 @@ pub fn spawn_batch_writer(conn: Connection, config: WriterConfig) -> Result<Batc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::EnvKeyProvider;
     use crate::schema::Database;
     use crate::types::EventData;
 
+    fn test_key() -> [u8; 32] {
+        [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ]
+    }
+
+    fn test_cryptor() -> BatchCryptor {
+        BatchCryptor::new(EnvKeyProvider::from_key(test_key()))
+    }
+
     fn create_test_writer() -> BatchWriter {
         let db = Database::open_in_memory().unwrap();
-        BatchWriter::new(db.into_connection(), WriterConfig::default()).unwrap()
+        BatchWriter::new(db.into_connection(), test_cryptor(), WriterConfig::default()).unwrap()
     }
 
     #[test]
@@ -1325,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_writer_single_command() {
         let db = Database::open_in_memory().unwrap();
-        let handle = spawn_batch_writer(db.into_connection(), WriterConfig::default()).unwrap();
+        let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), WriterConfig::default()).unwrap();
 
         let cmd = AppendCommand::new(
             "cmd-1",
@@ -1341,7 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_writer_transaction() {
         let db = Database::open_in_memory().unwrap();
-        let handle = spawn_batch_writer(db.into_connection(), WriterConfig::default()).unwrap();
+        let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), WriterConfig::default()).unwrap();
 
         let mut tx = handle.begin_transaction();
         tx.append(AppendCommand::new(
@@ -1371,7 +1262,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_writer_conflict_isolation() {
         let db = Database::open_in_memory().unwrap();
-        let handle = spawn_batch_writer(db.into_connection(), WriterConfig::default()).unwrap();
+        let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), WriterConfig::default()).unwrap();
 
         // First write to stream-1
         handle
@@ -1415,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_writer_idempotency() {
         let db = Database::open_in_memory().unwrap();
-        let handle = spawn_batch_writer(db.into_connection(), WriterConfig::default()).unwrap();
+        let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), WriterConfig::default()).unwrap();
 
         let cmd = AppendCommand::new(
             "cmd-idem",
@@ -1435,7 +1326,7 @@ mod tests {
         // Test that multiple appends to the same stream within a transaction
         // use staged state correctly
         let db = Database::open_in_memory().unwrap();
-        let handle = spawn_batch_writer(db.into_connection(), WriterConfig::default()).unwrap();
+        let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), WriterConfig::default()).unwrap();
 
         let mut tx = handle.begin_transaction();
         tx.append(AppendCommand::new(
@@ -1484,7 +1375,7 @@ mod tests {
         // Verify that a conflict in the middle of a batch doesn't prevent
         // other commands from being committed
         let db = Database::open_in_memory().unwrap();
-        let handle = spawn_batch_writer(db.into_connection(), WriterConfig::default()).unwrap();
+        let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), WriterConfig::default()).unwrap();
 
         // Setup: create stream-1 with one event
         handle
@@ -1543,7 +1434,7 @@ mod tests {
             batch_timeout: Duration::from_millis(100),
             batch_max_size: 100,
         };
-        let handle = spawn_batch_writer(db.into_connection(), config).unwrap();
+        let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), config).unwrap();
 
         // Spawn multiple concurrent append tasks
         let mut handles = Vec::new();
@@ -1577,7 +1468,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_writer_empty_transaction() {
         let db = Database::open_in_memory().unwrap();
-        let handle = spawn_batch_writer(db.into_connection(), WriterConfig::default()).unwrap();
+        let handle = spawn_batch_writer(db.into_connection(), test_cryptor(), WriterConfig::default()).unwrap();
 
         let tx = handle.begin_transaction();
         assert!(tx.is_empty());

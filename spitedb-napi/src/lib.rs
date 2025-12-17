@@ -81,10 +81,8 @@ impl SpiteDBNapi {
         // 0 = stream must not exist (StreamRev::NONE)
         // >0 = exact revision
         let expected = if expected_rev < 0 {
-            // For "any", we use a very high revision that will always pass
-            // Actually, we need to handle this in the core - for now use NONE as workaround
-            // TODO: Add proper "any" support to core API
-            StreamRev::NONE
+            // For "any", we use the ANY sentinel
+            StreamRev::ANY
         } else {
             StreamRev::from_raw(expected_rev as u64)
         };

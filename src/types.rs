@@ -470,6 +470,12 @@ impl StreamRev {
     /// - Any other value means "stream should be at this exact revision"
     pub const NONE: StreamRev = StreamRev(0);
 
+    /// Sentinel value meaning "any revision is acceptable".
+    ///
+    /// When checking expected_rev:
+    /// - `ANY` means "ignore concurrency checks, just append"
+    pub const ANY: StreamRev = StreamRev(u64::MAX);
+
     /// Creates a StreamRev from a raw value.
     pub fn from_raw(value: u64) -> Self {
         Self(value)

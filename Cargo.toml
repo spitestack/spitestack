@@ -74,6 +74,34 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"
 # - Core abstraction for async sequences of values
 futures = "0.3"
 
+# =============================================================================
+# Compression
+# =============================================================================
+# zstd: Zstandard compression library
+# - Level 1 provides excellent speed with reasonable compression ratios
+# - Widely used in production (Facebook, PostgreSQL, etc.)
+zstd = "0.13"
+
+# =============================================================================
+# Cryptography
+# =============================================================================
+# aes-gcm: AES-256-GCM authenticated encryption
+# - Provides both confidentiality and integrity
+# - NIST-approved, industry standard
+aes-gcm = "0.10"
+
+# hkdf: HMAC-based Key Derivation Function (RFC 5869)
+# - Derives per-batch keys from master key
+# - Standard approach for key derivation
+hkdf = "0.12"
+
+# sha2: SHA-256 for HKDF
+sha2 = "0.10"
+
+# rand: Cryptographically secure random number generation
+# - For generating nonces (12 bytes for AES-GCM)
+rand = { version = "0.8", features = ["std_rng"] }
+
 [dev-dependencies]
 # tempfile: Create temporary files/directories for testing
 # - Automatically cleaned up when TempDir goes out of scope

@@ -176,6 +176,54 @@ pub enum Error {
     Schema(String),
 
     // =========================================================================
+    // Cryptography Errors
+    // =========================================================================
+
+    /// Compression or decompression failed.
+    ///
+    /// # When This Happens
+    ///
+    /// - Zstd compression failed (rare, usually indicates memory issues)
+    /// - Zstd decompression failed (corrupted data or wrong codec)
+    ///
+    /// # Recovery
+    ///
+    /// Investigate the source data. If decompression fails, the batch may be
+    /// corrupted or encrypted with a different key.
+    #[error("compression error: {0}")]
+    Compression(String),
+
+    /// Encryption or decryption failed.
+    ///
+    /// # When This Happens
+    ///
+    /// - AES-GCM encryption failed (rare)
+    /// - AES-GCM decryption failed (wrong key, corrupted data, tampered ciphertext)
+    /// - Invalid nonce
+    ///
+    /// # Recovery
+    ///
+    /// If decryption fails, verify the master key is correct. Authentication
+    /// failures indicate the data was tampered with or the wrong key was used.
+    #[error("encryption error: {0}")]
+    Encryption(String),
+
+    /// Key provider configuration error.
+    ///
+    /// # When This Happens
+    ///
+    /// - `SPITEDB_MASTER_KEY` environment variable not set
+    /// - Invalid key format (not hex, wrong length)
+    /// - KMS connection failures (future)
+    ///
+    /// # Recovery
+    ///
+    /// Set the `SPITEDB_MASTER_KEY` environment variable to a 64-character
+    /// hex string (32 bytes).
+    #[error("key provider error: {0}")]
+    KeyProvider(String),
+
+    // =========================================================================
     // High Availability Errors (Stop writing, trigger failover)
     // =========================================================================
 
@@ -204,41 +252,6 @@ pub enum Error {
         /// The actual current epoch
         current: u64,
     },
-
-    // =========================================================================
-    // Subscription Errors
-    // =========================================================================
-
-    /// Subscription fell behind and missed events.
-    ///
-    /// # When This Happens
-    ///
-    /// The broadcast channel has a bounded capacity. If a subscriber can't keep
-    /// up with the rate of events being published, older events get dropped to
-    /// make room for new ones. The subscriber receives this error indicating
-    /// how many events were missed.
-    ///
-    /// # Systems Concept: Backpressure
-    ///
-    /// In streaming systems, producers and consumers may operate at different
-    /// speeds. Backpressure mechanisms prevent unbounded memory growth:
-    /// - **Bounded buffers**: Fixed-size queues that drop oldest items
-    /// - **Flow control**: Slow down producers when consumers lag
-    /// - **Lossy**: Accept some data loss (our approach for subscriptions)
-    ///
-    /// We chose lossy because:
-    /// - Subscribers can catch up by re-reading from the database
-    /// - It keeps memory bounded regardless of subscriber speed
-    /// - Fast subscribers aren't penalized by slow ones
-    ///
-    /// # Recovery
-    ///
-    /// The subscriber should:
-    /// 1. Note the last successfully received position
-    /// 2. Create a new subscription from that position
-    /// 3. The new subscription will catch up from the database
-    #[error("subscription lagged: missed {0} events")]
-    SubscriptionLagged(u64),
 }
 
 // =============================================================================

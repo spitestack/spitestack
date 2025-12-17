@@ -88,6 +88,12 @@ pub mod types;
 /// them back. The batch format is designed for efficient storage and retrieval.
 pub mod codec;
 
+/// Cryptographic primitives for batch encryption.
+///
+/// This module provides compression (Zstd level 1) and encryption (AES-256-GCM)
+/// for event batches. All batches are compressed and encrypted by default.
+pub mod crypto;
+
 /// Read operations for SpiteDB.
 ///
 /// This module provides read operations using direct SQL queries. It ensures
@@ -117,20 +123,6 @@ pub mod api;
 /// - Staged/committed state separation for memory safety
 pub mod writer;
 
-/// Subscriptions and live tailing.
-///
-/// This module implements real-time event subscriptions. Subscribers can
-/// receive events as they're committed, starting from any historical position.
-///
-/// Key features:
-/// - Live event streaming via broadcast channel
-/// - Catch-up from historical position then seamless switch to live
-/// - Stream filtering (subscribe to specific streams)
-/// - Backpressure handling for slow subscribers
-///
-/// See [`subscription::SimpleSubscription`] for basic live subscriptions and
-/// [`subscription::CatchUpSubscription`] for catch-up + live pattern.
-pub mod subscription;
 
 /// Tombstones for GDPR-compliant deletion.
 ///
@@ -168,11 +160,6 @@ pub use types::{
     StreamTombstone, TenantTombstone,
 };
 
-// Re-export subscription types
-pub use subscription::{
-    BroadcastEvent, CatchUpSubscription, SimpleSubscription, SubscriptionBuilder,
-    SubscriptionManager,
-};
 
 // Re-export tombstone utilities
 pub use tombstones::{CompactionJob, CompactionStats};
