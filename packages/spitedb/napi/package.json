@@ -1,5 +1,5 @@
 {
-  "name": "@spitedb/napi",
+  "name": "@spitestack/db",
   "version": "0.1.0",
   "description": "NAPI bindings for SpiteDB - event store with projections",
   "type": "module",
