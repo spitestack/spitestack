@@ -10,8 +10,8 @@ use napi_derive::napi;
 use tokio::sync::Mutex;
 
 use spitedb::{
-    AppendCommand, AppendResult, CommandId, Event, EventData, GlobalPos, SpiteDB, StreamId,
-    StreamRev, Tenant,
+    AppendCommand, AppendResult, CommandId, Event, EventData, GlobalPos, MetricsSnapshot, SpiteDB,
+    StreamId, StreamRev, Tenant,
 };
 
 mod projection;
@@ -279,6 +279,17 @@ impl SpiteDBNapi {
             .await
             .map_err(|e| Error::from_reason(format!("Failed to get checkpoint: {}", e)))
     }
+
+    /// Gets current admission control metrics.
+    ///
+    /// Returns a snapshot of the adaptive admission control system's state,
+    /// useful for monitoring and debugging performance issues.
+    ///
+    /// @returns AdmissionMetricsNapi - current admission metrics snapshot
+    #[napi]
+    pub fn get_admission_metrics(&self) -> AdmissionMetricsNapi {
+        AdmissionMetricsNapi::from(self.inner.admission_metrics())
+    }
 }
 
 // =============================================================================
@@ -382,4 +393,39 @@ pub struct BatchResultNapi {
     pub operations: Vec<ProjectionOpNapi>,
     /// Last global position processed (for checkpoint)
     pub last_global_pos: i64,
+}
+
+/// Admission control metrics snapshot.
+///
+/// Provides visibility into the adaptive admission control system's state.
+#[napi(object)]
+pub struct AdmissionMetricsNapi {
+    /// Current max in-flight events (auto-adjusted based on observed latency)
+    pub current_limit: i64,
+    /// Observed p99 latency in milliseconds
+    pub observed_p99_ms: f64,
+    /// Target p99 latency in milliseconds (default: 60)
+    pub target_p99_ms: f64,
+    /// Total requests that completed successfully
+    pub requests_accepted: i64,
+    /// Total requests that timed out due to backpressure
+    pub requests_rejected: i64,
+    /// Ratio of rejected to total requests (0.0 to 1.0)
+    pub rejection_rate: f64,
+    /// Number of times the controller adjusted the max_inflight limit
+    pub adjustments: i64,
+}
+
+impl From<MetricsSnapshot> for AdmissionMetricsNapi {
+    fn from(m: MetricsSnapshot) -> Self {
+        Self {
+            current_limit: m.current_limit as i64,
+            observed_p99_ms: m.observed_p99_ms,
+            target_p99_ms: m.target_p99_ms,
+            requests_accepted: m.requests_accepted as i64,
+            requests_rejected: m.requests_rejected as i64,
+            rejection_rate: m.rejection_rate,
+            adjustments: m.adjustments as i64,
+        }
+    }
 }

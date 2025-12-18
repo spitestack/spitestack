@@ -56,18 +56,15 @@ use crate::{Error, Result};
 // Schema Version
 // =============================================================================
 
-/// Current schema version. Increment when making breaking schema changes.
+/// Current schema version.
 ///
 /// # Migration Strategy
 ///
-/// For v1, we don't implement migrations - if the version doesn't match,
-/// we return an error. Future versions may add migration support.
+/// We don't implement migrations - if the version doesn't match, opening
+/// the database returns an error.
 ///
-/// # Version History
-///
-/// - v1: Initial schema
-/// - v2: Added collision_slot to tombstones, added tenant_tombstones table
-const SCHEMA_VERSION: i32 = 2;
+/// SpiteDB is currently at its initial schema.
+const SCHEMA_VERSION: i32 = 1;
 
 // =============================================================================
 // DDL Statements
@@ -285,13 +282,16 @@ ON stream_heads(tenant_hash)
 /// Clients retrying after that period will fail, but that's expected behavior.
 const CREATE_COMMANDS: &str = r#"
 CREATE TABLE IF NOT EXISTS commands (
-    command_id  TEXT PRIMARY KEY,
+    tenant_hash INTEGER NOT NULL,
+    command_id  TEXT NOT NULL,
+    stream_id   TEXT NOT NULL,
     stream_hash INTEGER NOT NULL,
     first_pos   INTEGER NOT NULL,
     last_pos    INTEGER NOT NULL,
     first_rev   INTEGER NOT NULL,
     last_rev    INTEGER NOT NULL,
-    created_ms  INTEGER NOT NULL
+    created_ms  INTEGER NOT NULL,
+    PRIMARY KEY (tenant_hash, command_id)
 )
 "#;
 
@@ -304,12 +304,14 @@ CREATE TABLE IF NOT EXISTS commands (
 /// duplicate tombstones.
 const CREATE_DELETE_COMMANDS: &str = r#"
 CREATE TABLE IF NOT EXISTS delete_commands (
-    command_id  TEXT PRIMARY KEY,
-    stream_hash INTEGER NOT NULL,
     tenant_hash INTEGER NOT NULL,
+    command_id  TEXT NOT NULL,
+    stream_id   TEXT NOT NULL,
+    stream_hash INTEGER NOT NULL,
     from_rev    INTEGER NOT NULL,
     to_rev      INTEGER NOT NULL,
-    deleted_ms  INTEGER NOT NULL
+    deleted_ms  INTEGER NOT NULL,
+    PRIMARY KEY (tenant_hash, command_id)
 )
 "#;
 
@@ -645,7 +647,7 @@ impl Database {
     ///
     /// 1. Try to read the schema_version from metadata
     /// 2. If not found, this is a new database - set it
-    /// 3. If found but doesn't match, error (migration needed)
+    /// 3. If found but doesn't match, error
     /// 4. If found and matches, we're good
     fn verify_or_set_version(&mut self) -> Result<()> {
         let existing: Option<i32> = self
@@ -674,7 +676,7 @@ impl Database {
                 // Version matches, nothing to do
             }
             Some(v) => {
-                // Version mismatch - this is an error for v1 (no migrations)
+                // Version mismatch - no migrations supported
                 return Err(Error::Schema(format!(
                     "schema version mismatch: database has version {v}, but this SpiteDB version requires {SCHEMA_VERSION}"
                 )));

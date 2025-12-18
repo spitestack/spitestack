@@ -224,6 +224,32 @@ pub enum Error {
     KeyProvider(String),
 
     // =========================================================================
+    // Admission Control Errors (Client should retry or back off)
+    // =========================================================================
+
+    /// Request exceeded deadline due to backpressure.
+    ///
+    /// # When This Happens
+    ///
+    /// Under high load, the admission control system limits in-flight requests.
+    /// If a request cannot be processed within its deadline (default 100ms),
+    /// this error is returned.
+    ///
+    /// # Systems Concept: Backpressure
+    ///
+    /// Rather than allowing unbounded queueing (which causes p99 latency to
+    /// explode), we limit concurrent requests. When at capacity, new requests
+    /// wait for permits. If waiting exceeds the deadline, we fail fast.
+    ///
+    /// # Recovery
+    ///
+    /// - Client should implement exponential backoff
+    /// - HTTP layer should return 503 Service Unavailable with Retry-After
+    /// - Consider reducing request rate if errors persist
+    #[error("request timeout: {0}")]
+    Timeout(String),
+
+    // =========================================================================
     // High Availability Errors (Stop writing, trigger failover)
     // =========================================================================
 

@@ -352,11 +352,26 @@ impl SpiteDB {
         from_rev: StreamRev,
         limit: usize,
     ) -> Result<Vec<Event>> {
+        self.read_stream_tenant(stream_id, Tenant::default_tenant(), from_rev, limit).await
+    }
+
+    /// Reads events from a specific stream within a specific tenant.
+    pub async fn read_stream_tenant(
+        &self,
+        stream_id: impl Into<StreamId>,
+        tenant: impl Into<Tenant>,
+        from_rev: StreamRev,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
         let (response_tx, response_rx) = oneshot::channel();
+
+        let stream_id = stream_id.into();
+        let tenant_hash = tenant.into().hash();
 
         self.read_tx
             .send(ReadRequest::ReadStream {
-                stream_id: stream_id.into(),
+                stream_id,
+                tenant_hash,
                 from_rev,
                 limit,
                 response: response_tx,
@@ -400,11 +415,24 @@ impl SpiteDB {
     ///
     /// Returns `StreamRev::NONE` if the stream doesn't exist.
     pub async fn get_stream_revision(&self, stream_id: impl Into<StreamId>) -> Result<StreamRev> {
+        self.get_stream_revision_tenant(stream_id, Tenant::default_tenant()).await
+    }
+
+    /// Gets the current revision of a stream within a specific tenant.
+    pub async fn get_stream_revision_tenant(
+        &self,
+        stream_id: impl Into<StreamId>,
+        tenant: impl Into<Tenant>,
+    ) -> Result<StreamRev> {
         let (response_tx, response_rx) = oneshot::channel();
+
+        let stream_id = stream_id.into();
+        let tenant_hash = tenant.into().hash();
 
         self.read_tx
             .send(ReadRequest::GetStreamRevision {
-                stream_id: stream_id.into(),
+                stream_id,
+                tenant_hash,
                 response: response_tx,
             })
             .await
@@ -510,6 +538,33 @@ impl SpiteDB {
     ) -> Result<DeleteTenantResult> {
         let command = DeleteTenantCommand::new(command_id, tenant);
         self.writer.delete_tenant(command).await
+    }
+
+    /// Gets current admission control metrics.
+    ///
+    /// # Observability
+    ///
+    /// Returns a snapshot of the adaptive admission control system's state:
+    /// - `current_limit`: Current max in-flight events (auto-adjusted)
+    /// - `observed_p99_ms`: Observed p99 latency in milliseconds
+    /// - `target_p99_ms`: Target p99 latency (default 60ms)
+    /// - `requests_accepted`: Total requests that completed successfully
+    /// - `requests_rejected`: Total requests that timed out
+    /// - `rejection_rate`: Ratio of rejected to total requests
+    /// - `adjustments`: Number of times the controller adjusted the limit
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let metrics = db.admission_metrics();
+    /// println!("Current limit: {}", metrics.current_limit);
+    /// println!("Observed p99: {:.2}ms", metrics.observed_p99_ms);
+    /// if metrics.rejection_rate > 0.05 {
+    ///     println!("Warning: High rejection rate!");
+    /// }
+    /// ```
+    pub fn admission_metrics(&self) -> crate::writer::MetricsSnapshot {
+        self.writer.metrics()
     }
 
     /// Shuts down the database gracefully.

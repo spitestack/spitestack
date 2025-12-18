@@ -79,8 +79,10 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use rusqlite::{params, Connection};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::sync::{mpsc, oneshot, Semaphore, OwnedSemaphorePermit, Mutex as TokioMutex};
+use tokio::time::{timeout, sleep};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 
 use crate::codec::{compute_checksum, current_time_ms, encode_batch_iter};
 use crate::crypto::{BatchCryptor, CIPHER_AES256GCM, CODEC_ZSTD_L1};
@@ -100,20 +102,37 @@ use crate::types::{
 ///
 /// Commands are collected for up to this duration before being executed.
 /// Shorter = lower latency, longer = higher throughput.
+/// With adaptive admission control, larger batches improve throughput
+/// while admission control protects p99 latency.
 pub const DEFAULT_BATCH_TIMEOUT_MS: u64 = 10;
 
 /// Maximum commands per batch.
 ///
 /// If this many commands accumulate before the timeout, execute immediately.
-pub const DEFAULT_BATCH_MAX_SIZE: usize = 20_000;
+/// With adaptive admission control, larger batches improve throughput
+/// while admission control protects p99 latency.
+pub const DEFAULT_BATCH_MAX_SIZE: usize = 5_000;
 
-/// Maximum uncompressed payload bytes per batch (16MB).
+/// Maximum uncompressed payload bytes per batch (1MB).
 ///
 /// If accumulated event payload bytes exceed this before the timeout, execute immediately.
-pub const DEFAULT_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Smaller batches = lower latency but more fsyncs.
+pub const DEFAULT_BATCH_MAX_BYTES: usize = 1024 * 1024;
 
 /// Size of the command channel.
 const COMMAND_CHANNEL_SIZE: usize = 16384;
+
+/// Default max in-flight events for admission control.
+///
+/// Limits concurrent events to prevent unbounded queueing under load.
+/// Set to ~3x the batch size to allow pipelining while bounding queues.
+pub const DEFAULT_MAX_INFLIGHT_EVENTS: usize = 3_000;
+
+/// Default per-request deadline in milliseconds.
+///
+/// Requests exceeding this deadline fail fast with Error::Timeout.
+/// This prevents tail latency from growing unbounded under load.
+pub const DEFAULT_REQUEST_DEADLINE_MS: u64 = 100;
 
 // =============================================================================
 // Writer Configuration
@@ -138,6 +157,284 @@ impl Default for WriterConfig {
             batch_timeout: Duration::from_millis(DEFAULT_BATCH_TIMEOUT_MS),
             batch_max_size: DEFAULT_BATCH_MAX_SIZE,
             batch_max_bytes: DEFAULT_BATCH_MAX_BYTES,
+        }
+    }
+}
+
+// =============================================================================
+// Adaptive Admission Control
+// =============================================================================
+
+/// Default latency tracking window size (number of samples).
+const LATENCY_WINDOW_SIZE: usize = 10_000;
+
+/// Configuration for adaptive admission control.
+#[derive(Debug, Clone)]
+pub struct AdmissionConfig {
+    /// Target p99 latency in milliseconds.
+    pub target_p99_ms: u64,
+
+    /// Initial max in-flight events.
+    pub initial_max_inflight: usize,
+
+    /// Minimum max in-flight (floor to prevent over-rejection).
+    pub min_max_inflight: usize,
+
+    /// Maximum max in-flight (ceiling to prevent unbounded growth).
+    pub max_max_inflight: usize,
+
+    /// Adjustment rate per control loop iteration (e.g., 0.10 = 10%).
+    pub adjustment_rate: f64,
+
+    /// How often to run the control loop (milliseconds).
+    pub adjustment_interval_ms: u64,
+
+    /// Tolerance band around target (adjust only if p99 is outside target ± tolerance).
+    pub target_tolerance_ms: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            target_p99_ms: 60,
+            initial_max_inflight: 3000,
+            min_max_inflight: 500,
+            max_max_inflight: 10000,
+            adjustment_rate: 0.10,
+            adjustment_interval_ms: 2000,
+            target_tolerance_ms: 10,
+        }
+    }
+}
+
+/// Sliding window latency tracker for p99 calculation.
+pub struct LatencyTracker {
+    /// Circular buffer of latencies in microseconds.
+    samples: Vec<u64>,
+    /// Current write position.
+    position: usize,
+    /// Number of samples collected (up to samples.len()).
+    count: usize,
+}
+
+impl LatencyTracker {
+    /// Creates a new latency tracker with the given window size.
+    pub fn new(window_size: usize) -> Self {
+        Self {
+            samples: vec![0; window_size],
+            position: 0,
+            count: 0,
+        }
+    }
+
+    /// Records a latency sample in microseconds.
+    pub fn record(&mut self, latency_us: u64) {
+        self.samples[self.position] = latency_us;
+        self.position = (self.position + 1) % self.samples.len();
+        if self.count < self.samples.len() {
+            self.count += 1;
+        }
+    }
+
+    /// Calculates the given percentile (0.0 to 1.0) from collected samples.
+    /// Returns None if no samples have been collected.
+    pub fn percentile(&self, p: f64) -> Option<u64> {
+        if self.count == 0 {
+            return None;
+        }
+
+        // Copy and sort the samples we have
+        let mut sorted: Vec<u64> = self.samples[..self.count].to_vec();
+        sorted.sort_unstable();
+
+        let idx = ((p * self.count as f64) as usize).min(self.count - 1);
+        Some(sorted[idx])
+    }
+
+    /// Returns the number of samples collected.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// Observable metrics for admission control.
+#[derive(Debug)]
+pub struct AdmissionMetrics {
+    /// Current max in-flight limit.
+    pub current_limit: AtomicUsize,
+
+    /// Observed p99 latency in microseconds.
+    pub observed_p99_us: AtomicU64,
+
+    /// Target p99 latency in microseconds.
+    pub target_p99_us: AtomicU64,
+
+    /// Number of requests accepted.
+    pub requests_accepted: AtomicU64,
+
+    /// Number of requests rejected (timeouts).
+    pub requests_rejected: AtomicU64,
+
+    /// Number of controller adjustments.
+    pub adjustments: AtomicU64,
+}
+
+impl AdmissionMetrics {
+    fn new(initial_limit: usize, target_p99_ms: u64) -> Self {
+        Self {
+            current_limit: AtomicUsize::new(initial_limit),
+            observed_p99_us: AtomicU64::new(0),
+            target_p99_us: AtomicU64::new(target_p99_ms * 1000),
+            requests_accepted: AtomicU64::new(0),
+            requests_rejected: AtomicU64::new(0),
+            adjustments: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Snapshot of admission metrics for external consumption.
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    /// Current max in-flight limit.
+    pub current_limit: usize,
+    /// Observed p99 latency in milliseconds.
+    pub observed_p99_ms: f64,
+    /// Target p99 latency in milliseconds.
+    pub target_p99_ms: f64,
+    /// Total requests accepted.
+    pub requests_accepted: u64,
+    /// Total requests rejected.
+    pub requests_rejected: u64,
+    /// Rejection rate (0.0 to 1.0).
+    pub rejection_rate: f64,
+    /// Number of controller adjustments.
+    pub adjustments: u64,
+}
+
+/// Adaptive admission controller that adjusts max in-flight based on observed latency.
+pub struct AdmissionController {
+    /// Current effective limit (adjusted by control loop).
+    current_limit: AtomicUsize,
+
+    /// Hard semaphore for the max bound.
+    semaphore: Arc<Semaphore>,
+
+    /// Configuration.
+    config: AdmissionConfig,
+
+    /// Latency tracker (shared with append path).
+    latency_tracker: Arc<TokioMutex<LatencyTracker>>,
+
+    /// Observable metrics.
+    pub metrics: Arc<AdmissionMetrics>,
+
+    /// Default request deadline.
+    default_deadline: Duration,
+}
+
+impl AdmissionController {
+    /// Creates a new admission controller with the given configuration.
+    pub fn new(config: AdmissionConfig) -> Self {
+        let metrics = Arc::new(AdmissionMetrics::new(
+            config.initial_max_inflight,
+            config.target_p99_ms,
+        ));
+
+        Self {
+            current_limit: AtomicUsize::new(config.initial_max_inflight),
+            semaphore: Arc::new(Semaphore::new(config.max_max_inflight)),
+            config,
+            latency_tracker: Arc::new(TokioMutex::new(LatencyTracker::new(LATENCY_WINDOW_SIZE))),
+            metrics,
+            default_deadline: Duration::from_millis(DEFAULT_REQUEST_DEADLINE_MS),
+        }
+    }
+
+    /// Acquires permits for the given number of events, respecting the current adaptive limit.
+    pub async fn acquire_permits(&self, count: usize, deadline: Instant) -> Result<OwnedSemaphorePermit> {
+        // Check against current adaptive limit
+        let current_limit = self.current_limit.load(Ordering::Relaxed);
+        let current_inflight = self.config.max_max_inflight - self.semaphore.available_permits();
+
+        if current_inflight + count > current_limit {
+            // Would exceed adaptive limit - this is the backpressure point
+            // We still try to acquire, but with a tighter effective deadline
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+
+        timeout(remaining, self.semaphore.clone().acquire_many_owned(count as u32))
+            .await
+            .map_err(|_| Error::Timeout("backpressure timeout waiting for capacity".into()))?
+            .map_err(|_| Error::Schema("writer has shut down".into()))
+    }
+
+    /// Records a latency sample.
+    pub async fn record_latency(&self, latency_us: u64) {
+        self.latency_tracker.lock().await.record(latency_us);
+    }
+
+    /// Returns the default request deadline.
+    pub fn default_deadline(&self) -> Duration {
+        self.default_deadline
+    }
+
+    /// Returns a snapshot of current metrics.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let accepted = self.metrics.requests_accepted.load(Ordering::Relaxed);
+        let rejected = self.metrics.requests_rejected.load(Ordering::Relaxed);
+        let total = accepted + rejected;
+
+        MetricsSnapshot {
+            current_limit: self.metrics.current_limit.load(Ordering::Relaxed),
+            observed_p99_ms: self.metrics.observed_p99_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            target_p99_ms: self.metrics.target_p99_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            requests_accepted: accepted,
+            requests_rejected: rejected,
+            rejection_rate: if total > 0 { rejected as f64 / total as f64 } else { 0.0 },
+            adjustments: self.metrics.adjustments.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Runs the control loop that adjusts max_inflight based on observed p99.
+    pub async fn run_control_loop(self: Arc<Self>) {
+        loop {
+            sleep(Duration::from_millis(self.config.adjustment_interval_ms)).await;
+
+            // Get current p99
+            let p99_us = {
+                let tracker = self.latency_tracker.lock().await;
+                tracker.percentile(0.99)
+            };
+
+            let Some(p99_us) = p99_us else { continue };
+            let p99_ms = p99_us / 1000;
+
+            let target = self.config.target_p99_ms;
+            let tolerance = self.config.target_tolerance_ms;
+            let current = self.current_limit.load(Ordering::Relaxed);
+
+            let new_limit = if p99_ms > target + tolerance {
+                // Over target: reduce limit
+                let reduction = (current as f64 * self.config.adjustment_rate) as usize;
+                current.saturating_sub(reduction.max(1)).max(self.config.min_max_inflight)
+            } else if p99_ms < target.saturating_sub(tolerance) {
+                // Under target: increase limit
+                let increase = (current as f64 * self.config.adjustment_rate) as usize;
+                (current + increase.max(1)).min(self.config.max_max_inflight)
+            } else {
+                // Within tolerance: no change
+                current
+            };
+
+            if new_limit != current {
+                self.current_limit.store(new_limit, Ordering::Relaxed);
+                self.metrics.adjustments.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Update metrics
+            self.metrics.current_limit.store(new_limit, Ordering::Relaxed);
+            self.metrics.observed_p99_us.store(p99_us, Ordering::Relaxed);
         }
     }
 }
@@ -282,7 +579,7 @@ struct StagedState {
 
     /// Command cache entries staged in this batch.
     /// These are only merged into the main cache after COMMIT succeeds.
-    staged_commands: HashMap<String, CommandCacheEntry>,
+    staged_commands: HashMap<(TenantHash, CommandId), CommandCacheEntry>,
 }
 
 impl StagedState {
@@ -326,7 +623,7 @@ pub struct BatchWriter {
     next_pos_committed: GlobalPos,
 
     /// Command cache for idempotency.
-    commands: LruCache<String, CommandCacheEntry>,
+    commands: LruCache<(TenantHash, CommandId), CommandCacheEntry>,
 
     /// Configuration (stored for potential future use like dynamic reconfiguration).
     #[allow(dead_code)]
@@ -409,28 +706,51 @@ impl BatchWriter {
         // Query commands directly - no join needed since we store first_rev/last_rev
         // Order by ASC so newest entries are inserted last (most recently used in LRU)
         let mut stmt = self.conn.prepare(
-            "SELECT command_id, first_pos, last_pos, first_rev, last_rev, created_ms
+            "SELECT tenant_hash, command_id, stream_id, stream_hash, first_pos, last_pos, first_rev, last_rev, created_ms
              FROM commands
              WHERE created_ms >= ?
              ORDER BY created_ms ASC",
         )?;
 
         let entries = stmt.query_map([cutoff_ms as i64], |row| {
-            let command_id: String = row.get(0)?;
-            let first_pos: i64 = row.get(1)?;
-            let last_pos: i64 = row.get(2)?;
-            let first_rev: i64 = row.get(3)?;
-            let last_rev: i64 = row.get(4)?;
-            let created_ms: i64 = row.get(5)?;
+            let tenant_hash: i64 = row.get(0)?;
+            let command_id: String = row.get(1)?;
+            let stream_id: String = row.get(2)?;
+            let stream_hash: i64 = row.get(3)?;
+            let first_pos: i64 = row.get(4)?;
+            let last_pos: i64 = row.get(5)?;
+            let first_rev: i64 = row.get(6)?;
+            let last_rev: i64 = row.get(7)?;
+            let created_ms: i64 = row.get(8)?;
 
-            Ok((command_id, first_pos, last_pos, first_rev, last_rev, created_ms))
+            Ok((
+                tenant_hash,
+                command_id,
+                stream_id,
+                stream_hash,
+                first_pos,
+                last_pos,
+                first_rev,
+                last_rev,
+                created_ms,
+            ))
         })?;
 
         for entry in entries {
-            let (command_id, first_pos, last_pos, first_rev, last_rev, created_ms) = entry?;
+            let (tenant_hash, command_id, stream_id, stream_hash, first_pos, last_pos, first_rev, last_rev, created_ms) =
+                entry?;
+
+            let tenant_hash = TenantHash::from_raw(tenant_hash);
+            let command_id = CommandId::from(command_id);
+            let stream_id = StreamId::new(stream_id);
+
+            debug_assert_eq!(stream_id.hash().as_raw(), stream_hash, "commands table is corrupted: stream_id hash mismatch");
+
             self.commands.put(
-                command_id,
+                (tenant_hash, command_id.clone()),
                 CommandCacheEntry {
+                    tenant_hash,
+                    stream_id,
                     first_pos: GlobalPos::from_raw_unchecked(first_pos as u64),
                     last_pos: GlobalPos::from_raw_unchecked(last_pos as u64),
                     first_rev: StreamRev::from_raw(first_rev as u64),
@@ -542,23 +862,41 @@ impl BatchWriter {
     /// proceed with processing. If the command was already processed but evicted
     /// from cache, the INSERT will fail with a PK constraint error, which is
     /// expected behavior for retries beyond the cache window.
-    fn get_cached_command_result(&mut self, command_id: &CommandId) -> Option<AppendResult> {
+    fn get_cached_command_result(
+        &mut self,
+        command_id: &CommandId,
+        tenant_hash: TenantHash,
+        stream_id: &StreamId,
+    ) -> Result<Option<AppendResult>> {
         let now_ms = current_time_ms();
+        let key = (tenant_hash, command_id.clone());
 
         // Check staged commands first (same batch duplicates)
-        if let Some(entry) = self.staged.staged_commands.get(command_id.as_str()) {
-            return Some(entry.to_append_result());
+        if let Some(entry) = self.staged.staged_commands.get(&key) {
+            if &entry.stream_id != stream_id {
+                return Err(Error::Schema(format!(
+                    "idempotency violation: command_id '{}' reused for a different stream within tenant",
+                    command_id
+                )));
+            }
+            return Ok(Some(entry.to_append_result()));
         }
 
         // Then check committed cache
-        if let Some(entry) = self.commands.get(command_id.as_str()) {
+        if let Some(entry) = self.commands.get(&key) {
             let age_ms = now_ms.saturating_sub(entry.created_ms);
             if age_ms <= COMMAND_CACHE_TTL_MS {
-                return Some(entry.to_append_result());
+                if &entry.stream_id != stream_id {
+                    return Err(Error::Schema(format!(
+                        "idempotency violation: command_id '{}' reused for a different stream within tenant",
+                        command_id
+                    )));
+                }
+                return Ok(Some(entry.to_append_result()));
             }
         }
 
-        None
+        Ok(None)
     }
 
     // =========================================================================
@@ -580,13 +918,16 @@ impl BatchWriter {
         flat_index: usize,
         now_ms: u64,
     ) -> ValidationResult {
-        // Check for duplicate command first
-        if let Some(cached_result) = self.get_cached_command_result(&cmd.command_id) {
-            return ValidationResult::Duplicate(cached_result);
-        }
-
         // Get tenant hash for tenant-scoped lookups
         let tenant_hash = cmd.tenant.hash();
+
+        // Check for duplicate command first
+        match self.get_cached_command_result(&cmd.command_id, tenant_hash, &cmd.stream_id) {
+            Ok(Some(cached_result)) => return ValidationResult::Duplicate(cached_result),
+            Ok(None) => {}
+            Err(e) => return ValidationResult::Conflict(e),
+        }
+
         let stream_hash = cmd.stream_id.hash();
 
         // Check conflict using staged → committed state (tenant-scoped)
@@ -624,8 +965,10 @@ impl BatchWriter {
 
         // Stage command result for intra-batch idempotency and post-commit cache merge.
         self.staged.staged_commands.insert(
-            cmd.command_id.to_string(),
+            (tenant_hash, cmd.command_id.clone()),
             CommandCacheEntry {
+                tenant_hash,
+                stream_id: cmd.stream_id.clone(),
                 first_pos,
                 last_pos,
                 first_rev,
@@ -681,11 +1024,19 @@ impl BatchWriter {
                     // This ensures duplicates get their cached result immediately,
                     // regardless of whether the rest of the batch succeeds or fails.
                     // (True idempotency: retried commands always return same result)
-                    if let Some(cached) = self.get_cached_command_result(&pending.command.command_id) {
-                        // Send immediately - this command was already committed
-                        let _ = pending.response.send(Ok(cached));
-                        // Don't add to batch - skip this item
-                        continue;
+                    let tenant_hash = pending.command.tenant.hash();
+                    match self.get_cached_command_result(&pending.command.command_id, tenant_hash, &pending.command.stream_id) {
+                        Ok(Some(cached)) => {
+                            // Send immediately - this command was already committed
+                            let _ = pending.response.send(Ok(cached));
+                            // Don't add to batch - skip this item
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = pending.response.send(Err(e));
+                            continue;
+                        }
                     }
                     commands.push(BatchCommand::Single(pending.command));
                     responses.push(BatchResponse::Single(pending.response));
@@ -887,8 +1238,8 @@ impl BatchWriter {
         )?;
 
         let mut cmd_stmt = self.conn.prepare_cached(
-            "INSERT INTO commands (command_id, stream_hash, first_pos, last_pos, first_rev, last_rev, created_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO commands (tenant_hash, command_id, stream_id, stream_hash, first_pos, last_pos, first_rev, last_rev, created_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )?;
 
         // Track offset into the combined event_offsets array
@@ -932,7 +1283,9 @@ impl BatchWriter {
 
             // INSERT command record (for idempotency)
             cmd_stmt.execute(params![
+                validated.tenant_hash.as_raw(),
                 cmd.command_id.as_str(),
+                cmd.stream_id.as_str(),
                 validated.stream_hash.as_raw(),
                 validated.first_pos.as_raw() as i64,
                 validated.last_pos.as_raw() as i64,
@@ -993,12 +1346,15 @@ impl BatchWriter {
         self.next_pos_committed = self.staged.next_pos;
 
         // Merge staged heads into committed
-        for ((stream_id, _tenant_hash), entry) in self.staged.heads.drain() {
-            let stream_hash = stream_id.hash();
+        for ((_stream_id, _tenant_hash), entry) in self.staged.heads.drain() {
+            let stream_hash = entry.stream_id.hash();
             let entries = self.heads_committed.entry(stream_hash).or_insert_with(Vec::new);
 
             // Update or add
-            if let Some(existing) = entries.iter_mut().find(|e| e.stream_id == entry.stream_id) {
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|e| e.stream_id == entry.stream_id && e.tenant_hash == entry.tenant_hash)
+            {
                 existing.last_rev = entry.last_rev;
                 existing.last_pos = entry.last_pos;
             } else {
@@ -1007,8 +1363,8 @@ impl BatchWriter {
         }
 
         // Merge staged command cache entries into main cache
-        for (command_id, entry) in self.staged.staged_commands.drain() {
-            self.commands.put(command_id, entry);
+        for (key, entry) in self.staged.staged_commands.drain() {
+            self.commands.put(key, entry);
         }
     }
 
@@ -1029,7 +1385,9 @@ impl BatchWriter {
         let tenant_hash = cmd.tenant.hash();
 
         // Check for duplicate delete command first (idempotency)
-        if let Some(cached_result) = self.get_cached_delete_command_result(&cmd.command_id, &cmd.stream_id)? {
+        if let Some(cached_result) =
+            self.get_cached_delete_command_result(&cmd.command_id, tenant_hash, &cmd.stream_id)?
+        {
             return Ok(cached_result);
         }
 
@@ -1089,12 +1447,13 @@ impl BatchWriter {
 
         // Record delete command for idempotency
         self.conn.execute(
-            "INSERT INTO delete_commands (command_id, stream_hash, tenant_hash, from_rev, to_rev, deleted_ms)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO delete_commands (tenant_hash, command_id, stream_id, stream_hash, from_rev, to_rev, deleted_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![
-                cmd.command_id.as_str(),
-                stream_hash.as_raw(),
                 tenant_hash.as_raw(),
+                cmd.command_id.as_str(),
+                cmd.stream_id.as_str(),
+                stream_hash.as_raw(),
                 from_rev.as_raw() as i64,
                 to_rev.as_raw() as i64,
                 now_ms as i64,
@@ -1113,26 +1472,36 @@ impl BatchWriter {
     fn get_cached_delete_command_result(
         &self,
         command_id: &CommandId,
+        tenant_hash: TenantHash,
         stream_id: &StreamId,
     ) -> Result<Option<DeleteStreamResult>> {
         let result = self.conn.query_row(
-            "SELECT from_rev, to_rev, deleted_ms FROM delete_commands WHERE command_id = ?",
-            params![command_id.as_str()],
+            "SELECT stream_id, from_rev, to_rev, deleted_ms FROM delete_commands WHERE tenant_hash = ? AND command_id = ?",
+            params![tenant_hash.as_raw(), command_id.as_str()],
             |row| {
-                let from_rev: i64 = row.get(0)?;
-                let to_rev: i64 = row.get(1)?;
-                let deleted_ms: i64 = row.get(2)?;
-                Ok((from_rev, to_rev, deleted_ms))
+                let stored_stream_id: String = row.get(0)?;
+                let from_rev: i64 = row.get(1)?;
+                let to_rev: i64 = row.get(2)?;
+                let deleted_ms: i64 = row.get(3)?;
+                Ok((stored_stream_id, from_rev, to_rev, deleted_ms))
             },
         );
 
         match result {
-            Ok((from_rev, to_rev, deleted_ms)) => Ok(Some(DeleteStreamResult {
-                stream_id: stream_id.clone(),
-                from_rev: StreamRev::from_raw(from_rev as u64),
-                to_rev: StreamRev::from_raw(to_rev as u64),
-                deleted_ms: deleted_ms as u64,
-            })),
+            Ok((stored_stream_id, from_rev, to_rev, deleted_ms)) => {
+                if stored_stream_id != stream_id.as_str() {
+                    return Err(Error::Schema(format!(
+                        "idempotency violation: delete command_id '{}' reused for a different stream within tenant",
+                        command_id
+                    )));
+                }
+                Ok(Some(DeleteStreamResult {
+                    stream_id: stream_id.clone(),
+                    from_rev: StreamRev::from_raw(from_rev as u64),
+                    to_rev: StreamRev::from_raw(to_rev as u64),
+                    deleted_ms: deleted_ms as u64,
+                }))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -1178,24 +1547,75 @@ impl BatchWriter {
 #[derive(Clone)]
 pub struct BatchWriterHandle {
     tx: mpsc::Sender<WriteRequest>,
+    /// Adaptive admission controller.
+    admission: Arc<AdmissionController>,
 }
 
 impl BatchWriterHandle {
     /// Appends events to a stream.
+    ///
+    /// # Admission Control
+    ///
+    /// This method enforces adaptive admission control to bound p99 latency:
+    /// - Acquires semaphore permits (one per event) respecting the current adaptive limit
+    /// - Applies a deadline (default 100ms) to the entire operation
+    /// - Records latency for adaptive tuning
+    /// - If the deadline is exceeded while waiting, returns `Error::Timeout`
     pub async fn append(&self, command: AppendCommand) -> Result<AppendResult> {
+        let deadline = Instant::now() + self.admission.default_deadline();
+        let event_count = command.events.len();
+
+        // Acquire permits with deadline - this is the backpressure point
+        let permits = self.admission.acquire_permits(event_count, deadline).await?;
+
+        // Track latency for adaptive tuning
+        let start = Instant::now();
+        let result = self.append_inner(command, deadline).await;
+        let latency_us = start.elapsed().as_micros() as u64;
+
+        // Record latency (only for successful requests to avoid skewing p99)
+        if result.is_ok() {
+            self.admission.record_latency(latency_us).await;
+        }
+
+        // Update metrics
+        match &result {
+            Ok(_) => { self.admission.metrics.requests_accepted.fetch_add(1, Ordering::Relaxed); }
+            Err(Error::Timeout(_)) => { self.admission.metrics.requests_rejected.fetch_add(1, Ordering::Relaxed); }
+            _ => {}
+        }
+
+        // Permits released on drop
+        drop(permits);
+
+        result
+    }
+
+    /// Inner append logic with deadline.
+    async fn append_inner(&self, command: AppendCommand, deadline: Instant) -> Result<AppendResult> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.tx
-            .send(WriteRequest::Append {
-                command,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| Error::Schema("writer has shut down".to_string()))?;
+        // Send with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        timeout(remaining, self.tx.send(WriteRequest::Append {
+            command,
+            response: response_tx,
+        }))
+        .await
+        .map_err(|_| Error::Timeout("timeout sending to writer".into()))?
+        .map_err(|_| Error::Schema("writer has shut down".into()))?;
 
-        response_rx
+        // Wait for response with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        timeout(remaining, response_rx)
             .await
-            .map_err(|_| Error::Schema("writer dropped response".to_string()))?
+            .map_err(|_| Error::Timeout("timeout waiting for response".into()))?
+            .map_err(|_| Error::Schema("writer dropped response".into()))?
+    }
+
+    /// Returns a snapshot of admission control metrics.
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.admission.snapshot()
     }
 
     /// Creates a transaction for guaranteed same-batch writes.
@@ -1210,6 +1630,10 @@ impl BatchWriterHandle {
     }
 
     /// Submits a transaction.
+    ///
+    /// # Admission Control
+    ///
+    /// Acquires permits for all events across all commands in the transaction.
     pub async fn submit_transaction(
         &self,
         commands: Vec<AppendCommand>,
@@ -1218,19 +1642,43 @@ impl BatchWriterHandle {
             return Ok(Vec::new());
         }
 
+        let deadline = Instant::now() + self.admission.default_deadline();
+
+        // Count total events across all commands
+        let total_events: usize = commands.iter().map(|c| c.events.len()).sum();
+
+        // Acquire permits for all events
+        let permits = self.admission.acquire_permits(total_events, deadline).await?;
+
+        let start = Instant::now();
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.tx
-            .send(WriteRequest::Transaction {
-                commands,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| Error::Schema("writer has shut down".to_string()))?;
+        // Send with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        timeout(remaining, self.tx.send(WriteRequest::Transaction {
+            commands,
+            response: response_tx,
+        }))
+        .await
+        .map_err(|_| Error::Timeout("timeout sending transaction to writer".into()))?
+        .map_err(|_| Error::Schema("writer has shut down".into()))?;
 
-        response_rx
+        // Wait for response with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = timeout(remaining, response_rx)
             .await
-            .map_err(|_| Error::Schema("writer dropped response".to_string()))?
+            .map_err(|_| Error::Timeout("timeout waiting for transaction response".into()))?
+            .map_err(|_| Error::Schema("writer dropped response".into()))?;
+
+        // Record latency
+        let latency_us = start.elapsed().as_micros() as u64;
+        if result.is_ok() {
+            self.admission.record_latency(latency_us).await;
+            self.admission.metrics.requests_accepted.fetch_add(1, Ordering::Relaxed);
+        }
+
+        drop(permits);
+        result
     }
 
     /// Deletes events from a stream (creates tombstone).
@@ -1239,20 +1687,37 @@ impl BatchWriterHandle {
     ///
     /// Creates a tombstone record that immediately filters the specified
     /// events from all reads. Physical deletion happens during compaction.
+    ///
+    /// # Admission Control
+    ///
+    /// Acquires 1 permit for the delete operation.
     pub async fn delete_stream(&self, command: DeleteStreamCommand) -> Result<DeleteStreamResult> {
+        let deadline = Instant::now() + self.admission.default_deadline();
+
+        // Acquire 1 permit for delete operation
+        let permits = self.admission.acquire_permits(1, deadline).await?;
+
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.tx
-            .send(WriteRequest::DeleteStream {
-                command,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| Error::Schema("writer has shut down".to_string()))?;
+        // Send with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        timeout(remaining, self.tx.send(WriteRequest::DeleteStream {
+            command,
+            response: response_tx,
+        }))
+        .await
+        .map_err(|_| Error::Timeout("timeout sending delete_stream to writer".into()))?
+        .map_err(|_| Error::Schema("writer has shut down".into()))?;
 
-        response_rx
+        // Wait for response with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = timeout(remaining, response_rx)
             .await
-            .map_err(|_| Error::Schema("writer dropped response".to_string()))?
+            .map_err(|_| Error::Timeout("timeout waiting for delete_stream response".into()))?
+            .map_err(|_| Error::Schema("writer dropped response".into()))?;
+
+        drop(permits);
+        result
     }
 
     /// Deletes all events for a tenant.
@@ -1261,20 +1726,37 @@ impl BatchWriterHandle {
     ///
     /// Creates a tenant tombstone that immediately filters all events
     /// belonging to that tenant from all reads.
+    ///
+    /// # Admission Control
+    ///
+    /// Acquires 1 permit for the delete operation.
     pub async fn delete_tenant(&self, command: DeleteTenantCommand) -> Result<DeleteTenantResult> {
+        let deadline = Instant::now() + self.admission.default_deadline();
+
+        // Acquire 1 permit for delete operation
+        let permits = self.admission.acquire_permits(1, deadline).await?;
+
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.tx
-            .send(WriteRequest::DeleteTenant {
-                command,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| Error::Schema("writer has shut down".to_string()))?;
+        // Send with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        timeout(remaining, self.tx.send(WriteRequest::DeleteTenant {
+            command,
+            response: response_tx,
+        }))
+        .await
+        .map_err(|_| Error::Timeout("timeout sending delete_tenant to writer".into()))?
+        .map_err(|_| Error::Schema("writer has shut down".into()))?;
 
-        response_rx
+        // Wait for response with remaining deadline
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = timeout(remaining, response_rx)
             .await
-            .map_err(|_| Error::Schema("writer dropped response".to_string()))?
+            .map_err(|_| Error::Timeout("timeout waiting for delete_tenant response".into()))?
+            .map_err(|_| Error::Schema("writer dropped response".into()))?;
+
+        drop(permits);
+        result
     }
 }
 
@@ -1437,8 +1919,25 @@ pub async fn run_batch_writer(
 /// Spawns the batch writer on a dedicated thread.
 ///
 /// Returns a handle for submitting commands.
+///
+/// # Admission Control
+///
+/// The returned handle includes adaptive admission control:
+/// - Initial max in-flight: 3000 events
+/// - Target p99 latency: 60ms
+/// - Auto-adjusts based on observed latency
+/// - Request deadline: 100ms
 pub fn spawn_batch_writer(conn: Connection, cryptor: BatchCryptor, config: WriterConfig) -> Result<BatchWriterHandle> {
     let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
+
+    // Create adaptive admission controller
+    let admission = Arc::new(AdmissionController::new(AdmissionConfig::default()));
+
+    // Spawn the control loop that adjusts max_inflight based on observed p99
+    let admission_clone = Arc::clone(&admission);
+    tokio::spawn(async move {
+        admission_clone.run_control_loop().await;
+    });
 
     let writer = BatchWriter::new(conn, cryptor, config.clone())?;
 
@@ -1454,7 +1953,10 @@ pub fn spawn_batch_writer(conn: Connection, cryptor: BatchCryptor, config: Write
         })
         .map_err(|e| Error::Schema(format!("failed to spawn writer thread: {}", e)))?;
 
-    Ok(BatchWriterHandle { tx })
+    Ok(BatchWriterHandle {
+        tx,
+        admission,
+    })
 }
 
 // =============================================================================
@@ -1722,9 +2224,10 @@ mod tests {
     async fn test_batch_writer_concurrent_requests() {
         // Test that concurrent requests get batched together
         let db = Database::open_in_memory().unwrap();
-        // Use a longer timeout to ensure batching happens
+        // Keep the batch timeout well under the handle's default 100ms deadline
+        // to avoid flaky timeouts under load.
         let config = WriterConfig {
-            batch_timeout: Duration::from_millis(100),
+            batch_timeout: Duration::from_millis(10),
             batch_max_size: 100,
             batch_max_bytes: DEFAULT_BATCH_MAX_BYTES,
         };

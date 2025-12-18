@@ -149,7 +149,11 @@ pub mod tombstones;
 pub use api::SpiteDB;
 pub use error::{Error, Result};
 pub use schema::Database;
-pub use writer::{BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer};
+pub use writer::{
+    BatchWriterHandle, TransactionBuilder, WriterConfig, spawn_batch_writer,
+    // Admission control types
+    AdmissionConfig, AdmissionController, AdmissionMetrics, MetricsSnapshot, LatencyTracker,
+};
 
 // Re-export commonly used types from the types module
 pub use types::{

@@ -67,6 +67,27 @@ export interface BatchResultNapi {
   /** Last global position processed (for checkpoint) */
   lastGlobalPos: number
 }
+/**
+ * Admission control metrics snapshot.
+ *
+ * Provides visibility into the adaptive admission control system's state.
+ */
+export interface AdmissionMetricsNapi {
+  /** Current max in-flight events (auto-adjusted based on observed latency) */
+  currentLimit: number
+  /** Observed p99 latency in milliseconds */
+  observedP99Ms: number
+  /** Target p99 latency in milliseconds (default: 60) */
+  targetP99Ms: number
+  /** Total requests that completed successfully */
+  requestsAccepted: number
+  /** Total requests that timed out due to backpressure */
+  requestsRejected: number
+  /** Ratio of rejected to total requests (0.0 to 1.0) */
+  rejectionRate: number
+  /** Number of times the controller adjusted the max_inflight limit */
+  adjustments: number
+}
 export type SpiteDBNapi = SpiteDbNapi
 /** NAPI wrapper for SpiteDB. */
 export declare class SpiteDbNapi {
@@ -114,6 +135,15 @@ export declare class SpiteDbNapi {
   getProjectionEvents(projectionName: string, batchSize: number): Promise<EventBatchNapi | null>
   /** Gets the current checkpoint for a projection. */
   getProjectionCheckpoint(projectionName: string): Promise<number | null>
+  /**
+   * Gets current admission control metrics.
+   *
+   * Returns a snapshot of the adaptive admission control system's state,
+   * useful for monitoring and debugging performance issues.
+   *
+   * @returns AdmissionMetricsNapi - current admission metrics snapshot
+   */
+  getAdmissionMetrics(): AdmissionMetricsNapi
 }
 
 // Re-export projection system types and functions

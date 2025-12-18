@@ -1,10 +1,20 @@
 /**
  * SpiteDB Append Load Test
  *
- * Time-based load test for measuring append throughput.
+ * Time-based load test for measuring append throughput with admission control.
  * Fires concurrent appends with realistic 1KB msgpack-encoded events.
  *
- * Usage: bun run bench/append-load-test.ts [duration_seconds]
+ * Features:
+ * - Ramp-up phase to gradually increase load
+ * - Separate tracking of timeout errors (expected under admission control)
+ * - Latency target validation (p99)
+ * - Goodput vs attempted throughput metrics
+ *
+ * Usage: bun run bench/append-load-test.ts [duration_seconds] [concurrency] [events_per_append] [p99_target_ms]
+ *
+ * Examples:
+ *   bun run bench/append-load-test.ts 60 2000 1 60    # 60s, 2000 workers, p99 target 60ms
+ *   bun run bench/append-load-test.ts 30 1000 1 50    # Conservative test
  */
 
 import { SpiteDbNapi } from '../index.js';
@@ -12,9 +22,12 @@ import { pack } from 'msgpackr';
 import { randomUUID } from 'crypto';
 import { unlinkSync, existsSync } from 'fs';
 
+// Configuration
 const DURATION_SECONDS = parseInt(process.argv[2] || '60', 10);
-const CONCURRENCY = parseInt(process.argv[3] || '5000', 10); // Parallel append calls in flight
-const EVENTS_PER_APPEND = parseInt(process.argv[4] || '1', 10); // Events per append call
+const CONCURRENCY = parseInt(process.argv[3] || '2000', 10); // Below max_inflight (3000)
+const EVENTS_PER_APPEND = parseInt(process.argv[4] || '1', 10);
+const P99_TARGET_MS = parseInt(process.argv[5] || '60', 10);
+const RAMP_UP_SECONDS = 5; // Gradually increase load over 5 seconds
 
 // Realistic 1KB event structure (mimics real-world e-commerce)
 interface RealisticEvent {
@@ -118,15 +131,46 @@ function percentile(sorted: number[], p: number): number {
   return sorted[Math.max(0, idx)];
 }
 
-async function runLoadTest() {
+// Test result interface for programmatic use
+export interface LoadTestResult {
+  durationSec: number;
+  eventsWritten: number;
+  bytesWritten: number;
+  eventsPerSec: number;
+  mbPerSec: number;
+  timeoutErrors: number;
+  otherErrors: number;
+  timeoutRate: number;
+  latency: {
+    min: number;
+    avg: number;
+    p50: number;
+    p95: number;
+    p99: number;
+    max: number;
+  };
+  p99TargetMet: boolean;
+}
+
+// Run load test with given parameters (exported for use by find-sustainable-throughput)
+export async function runLoadTest(
+  durationSeconds: number = DURATION_SECONDS,
+  concurrency: number = CONCURRENCY,
+  eventsPerAppend: number = EVENTS_PER_APPEND,
+  p99TargetMs: number = P99_TARGET_MS,
+  verbose: boolean = true
+): Promise<LoadTestResult> {
   const dbPath = './bench-test.db';
 
-  console.log('=== SpiteDB Append Load Test ===');
-  console.log(`Duration: ${DURATION_SECONDS}s`);
-  console.log(`Concurrency: ${CONCURRENCY} workers`);
-  console.log(`Events per append: ${EVENTS_PER_APPEND}`);
-  console.log(`Event size: ~1KB (msgpack encoded)`);
-  console.log('');
+  if (verbose) {
+    console.log('=== SpiteDB Append Load Test ===');
+    console.log(`Duration: ${durationSeconds}s (+ ${RAMP_UP_SECONDS}s ramp-up)`);
+    console.log(`Concurrency: ${concurrency} workers`);
+    console.log(`Events per append: ${eventsPerAppend}`);
+    console.log(`Event size: ~1KB (msgpack encoded)`);
+    console.log(`p99 target: ${p99TargetMs}ms`);
+    console.log('');
+  }
 
   // Clean up any previous benchmark file
   cleanup(dbPath);
@@ -136,34 +180,43 @@ async function runLoadTest() {
   let eventsWritten = 0;
   let bytesWritten = 0;
   let commandCounter = 0;
-  let errors = 0;
+  let timeoutErrors = 0;
+  let otherErrors = 0;
   let running = true;
 
   // Track latencies for percentile calculation
   const latencies: number[] = [];
 
   const startTime = performance.now();
-  const endTime = startTime + DURATION_SECONDS * 1000;
+  const endTime = startTime + (durationSeconds + RAMP_UP_SECONDS) * 1000;
 
   // Progress reporting
-  const progressInterval = setInterval(() => {
-    const elapsed = (performance.now() - startTime) / 1000;
-    const eventsPerSec = eventsWritten / elapsed;
-    const mbPerSec = bytesWritten / elapsed / 1024 / 1024;
-    process.stdout.write(
-      `\rProgress: ${eventsWritten.toLocaleString()} events | ${eventsPerSec.toFixed(0)} evt/s | ${mbPerSec.toFixed(2)} MB/s | ${Math.floor(elapsed)}s elapsed`
-    );
-  }, 1000);
+  let progressInterval: ReturnType<typeof setInterval> | null = null;
+  if (verbose) {
+    progressInterval = setInterval(() => {
+      const elapsed = (performance.now() - startTime) / 1000;
+      const eventsPerSec = eventsWritten / Math.max(1, elapsed - RAMP_UP_SECONDS);
+      const mbPerSec = bytesWritten / Math.max(1, elapsed - RAMP_UP_SECONDS) / 1024 / 1024;
+      const timeoutRate = timeoutErrors / Math.max(1, eventsWritten + timeoutErrors) * 100;
+      process.stdout.write(
+        `\rProgress: ${eventsWritten.toLocaleString()} events | ${eventsPerSec.toFixed(0)} evt/s | ${mbPerSec.toFixed(2)} MB/s | timeouts: ${timeoutRate.toFixed(1)}% | ${Math.floor(elapsed)}s elapsed`
+      );
+    }, 1000);
+  }
 
   // Worker function that continuously appends
   async function worker(workerId: number) {
+    // Stagger worker start times during ramp-up phase
+    const rampDelay = (workerId / concurrency) * RAMP_UP_SECONDS * 1000;
+    await new Promise(resolve => setTimeout(resolve, rampDelay));
+
     while (running && performance.now() < endTime) {
       const commandId = `cmd-${workerId}-${commandCounter++}`;
       const streamId = `stream-${Math.floor(Math.random() * 10000)}`;
 
       // Generate multiple events per append
       const events: Buffer[] = [];
-      for (let i = 0; i < EVENTS_PER_APPEND; i++) {
+      for (let i = 0; i < eventsPerAppend; i++) {
         events.push(generateEvent());
       }
 
@@ -172,62 +225,108 @@ async function runLoadTest() {
         await db.append(streamId, commandId, -1, events); // -1 = any revision
         const opEnd = performance.now();
         latencies.push(opEnd - opStart);
-        eventsWritten += EVENTS_PER_APPEND;
+        eventsWritten += eventsPerAppend;
         bytesWritten += events.reduce((sum, e) => sum + e.length, 0);
       } catch (e) {
-        errors++;
-        if (errors < 10) {
-          console.error('\nAppend failed:', e);
+        const errorMsg = String(e);
+        if (errorMsg.includes('timeout')) {
+          timeoutErrors++;
+        } else {
+          otherErrors++;
+          if (otherErrors < 10 && verbose) {
+            console.error('\nAppend failed:', e);
+          }
         }
       }
     }
   }
 
   // Launch concurrent workers
-  const workers = Array.from({ length: CONCURRENCY }, (_, i) => worker(i));
+  const workers = Array.from({ length: concurrency }, (_, i) => worker(i));
 
   // Wait for all workers
   await Promise.all(workers);
   running = false;
-  clearInterval(progressInterval);
+  if (progressInterval) {
+    clearInterval(progressInterval);
+  }
 
   const elapsed = performance.now() - startTime;
   const elapsedSec = elapsed / 1000;
+  // Subtract ramp-up time for accurate throughput calculation
+  const effectiveElapsedSec = Math.max(1, elapsedSec - RAMP_UP_SECONDS);
 
-  console.log('\n');
-  console.log('=== Results ===');
-  console.log(`Duration:      ${elapsedSec.toFixed(2)}s`);
-  console.log(`Total events:  ${eventsWritten.toLocaleString()}`);
-  console.log(`Total bytes:   ${(bytesWritten / 1024 / 1024).toFixed(2)} MB`);
-  console.log(`Events/sec:    ${(eventsWritten / elapsedSec).toFixed(0)}`);
-  console.log(`MB/sec:        ${(bytesWritten / elapsedSec / 1024 / 1024).toFixed(2)}`);
-  if (errors > 0) {
-    console.log(`Errors:        ${errors}`);
-  }
-
-  // Calculate and display latency percentiles
+  // Calculate latency stats
+  let latencyStats = { min: 0, avg: 0, p50: 0, p95: 0, p99: 0, max: 0 };
   if (latencies.length > 0) {
     latencies.sort((a, b) => a - b);
-    const p50 = percentile(latencies, 50);
-    const p95 = percentile(latencies, 95);
-    const p99 = percentile(latencies, 99);
-    const min = latencies[0];
-    const max = latencies[latencies.length - 1];
-    const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+    latencyStats = {
+      min: latencies[0],
+      avg: latencies.reduce((a, b) => a + b, 0) / latencies.length,
+      p50: percentile(latencies, 50),
+      p95: percentile(latencies, 95),
+      p99: percentile(latencies, 99),
+      max: latencies[latencies.length - 1],
+    };
+  }
+
+  const totalAttempted = eventsWritten + timeoutErrors * eventsPerAppend;
+  const timeoutRate = timeoutErrors / Math.max(1, timeoutErrors + Math.floor(eventsWritten / eventsPerAppend));
+  const p99TargetMet = latencyStats.p99 <= p99TargetMs;
+
+  if (verbose) {
+    console.log('\n');
+    console.log('=== Throughput ===');
+    console.log(`Duration:      ${elapsedSec.toFixed(2)}s (${RAMP_UP_SECONDS}s ramp-up + ${effectiveElapsedSec.toFixed(2)}s test)`);
+    console.log(`Attempted:     ${totalAttempted.toLocaleString()} events`);
+    console.log(`Successful:    ${eventsWritten.toLocaleString()} events (goodput)`);
+    console.log(`Total bytes:   ${(bytesWritten / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`Events/sec:    ${(eventsWritten / effectiveElapsedSec).toFixed(0)}`);
+    console.log(`MB/sec:        ${(bytesWritten / effectiveElapsedSec / 1024 / 1024).toFixed(2)}`);
 
     console.log('');
-    console.log('=== Latency (ms) ===');
-    console.log(`Min:           ${min.toFixed(2)}`);
-    console.log(`Avg:           ${avg.toFixed(2)}`);
-    console.log(`p50:           ${p50.toFixed(2)}`);
-    console.log(`p95:           ${p95.toFixed(2)}`);
-    console.log(`p99:           ${p99.toFixed(2)}`);
-    console.log(`Max:           ${max.toFixed(2)}`);
-    console.log(`Samples:       ${latencies.length.toLocaleString()}`);
+    console.log('=== Errors ===');
+    console.log(`Timeouts:      ${timeoutErrors} (${(timeoutRate * 100).toFixed(1)}% of requests)`);
+    console.log(`Other errors:  ${otherErrors}`);
+
+    if (latencies.length > 0) {
+      console.log('');
+      console.log('=== Latency (ms) ===');
+      console.log(`Min:           ${latencyStats.min.toFixed(2)}`);
+      console.log(`Avg:           ${latencyStats.avg.toFixed(2)}`);
+      console.log(`p50:           ${latencyStats.p50.toFixed(2)}`);
+      console.log(`p95:           ${latencyStats.p95.toFixed(2)}`);
+      console.log(`p99:           ${latencyStats.p99.toFixed(2)} ${p99TargetMet ? '✓' : '✗'} (target: ${p99TargetMs}ms)`);
+      console.log(`Max:           ${latencyStats.max.toFixed(2)}`);
+      console.log(`Samples:       ${latencies.length.toLocaleString()}`);
+    }
+
+    console.log('');
+    console.log('=== Summary ===');
+    console.log(`p99 Target:    ${p99TargetMs}ms ${p99TargetMet ? '✓ PASS' : '✗ FAIL'}`);
+    if (timeoutRate > 0.05) {
+      console.log(`⚠️  High timeout rate (${(timeoutRate * 100).toFixed(1)}%) - consider reducing concurrency`);
+    }
   }
 
   // Cleanup
   cleanup(dbPath);
+
+  return {
+    durationSec: effectiveElapsedSec,
+    eventsWritten,
+    bytesWritten,
+    eventsPerSec: eventsWritten / effectiveElapsedSec,
+    mbPerSec: bytesWritten / effectiveElapsedSec / 1024 / 1024,
+    timeoutErrors,
+    otherErrors,
+    timeoutRate,
+    latency: latencyStats,
+    p99TargetMet,
+  };
 }
 
-runLoadTest().catch(console.error);
+// Run if executed directly
+if (import.meta.main) {
+  runLoadTest().catch(console.error);
+}

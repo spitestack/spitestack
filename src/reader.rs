@@ -77,6 +77,7 @@ pub enum ReadRequest {
     /// Read events from a specific stream.
     ReadStream {
         stream_id: StreamId,
+        tenant_hash: TenantHash,
         from_rev: StreamRev,
         limit: usize,
         response: oneshot::Sender<Result<Vec<Event>>>,
@@ -97,6 +98,7 @@ pub enum ReadRequest {
     /// Get the current revision of a stream.
     GetStreamRevision {
         stream_id: StreamId,
+        tenant_hash: TenantHash,
         response: oneshot::Sender<StreamRev>,
     },
     /// Shutdown the reader.
@@ -126,22 +128,34 @@ pub fn read_stream(
     limit: usize,
     cryptor: &BatchCryptor,
 ) -> Result<Vec<Event>> {
+    read_stream_tenant(conn, stream_id, TenantHash::default_hash(), from_rev, limit, cryptor)
+}
+
+/// Reads events from a stream within a specific tenant using direct SQL queries.
+pub fn read_stream_tenant(
+    conn: &Connection,
+    stream_id: &StreamId,
+    tenant_hash: TenantHash,
+    from_rev: StreamRev,
+    limit: usize,
+    cryptor: &BatchCryptor,
+) -> Result<Vec<Event>> {
     let stream_hash = stream_id.hash();
 
-    // Get collision slot and tenant_hash from stream_heads
-    let head_info: Option<(i64, i64)> = match conn.query_row(
-        "SELECT collision_slot, tenant_hash FROM stream_heads WHERE stream_id = ?",
-        [stream_id.as_str()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+    // Get collision slot from stream_heads for this tenant.
+    let collision_slot: Option<i64> = match conn.query_row(
+        "SELECT collision_slot FROM stream_heads WHERE stream_id = ? AND tenant_hash = ?",
+        params![stream_id.as_str(), tenant_hash.as_raw()],
+        |row| row.get(0),
     ) {
         Ok(v) => Some(v),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
         Err(e) => return Err(e.into()),
     };
 
-    let (collision_slot, tenant_hash) = match head_info {
-        Some((slot, tenant)) => (slot, TenantHash::from_raw(tenant)),
-        None => return Ok(Vec::new()), // Stream doesn't exist
+    let collision_slot = match collision_slot {
+        Some(slot) => slot,
+        None => return Ok(Vec::new()), // Stream doesn't exist in this tenant
     };
 
     let collision_slot_typed = CollisionSlot::from_raw(collision_slot as u16);
@@ -413,9 +427,14 @@ pub fn read_tenant_events(
 /// The current revision of the stream, or `StreamRev::NONE` if the stream
 /// doesn't exist.
 pub fn get_stream_revision(conn: &Connection, stream_id: &StreamId) -> StreamRev {
+    get_stream_revision_tenant(conn, stream_id, TenantHash::default_hash())
+}
+
+/// Gets stream revision for a specific tenant.
+pub fn get_stream_revision_tenant(conn: &Connection, stream_id: &StreamId, tenant_hash: TenantHash) -> StreamRev {
     conn.query_row(
-        "SELECT last_rev FROM stream_heads WHERE stream_id = ?",
-        [stream_id.as_str()],
+        "SELECT last_rev FROM stream_heads WHERE stream_id = ? AND tenant_hash = ?",
+        params![stream_id.as_str(), tenant_hash.as_raw()],
         |row| {
             let rev: i64 = row.get(0)?;
             Ok(StreamRev::from_raw(rev as u64))
@@ -453,11 +472,12 @@ pub async fn run_reader_pooled(
         match request {
             Some(ReadRequest::ReadStream {
                 stream_id,
+                tenant_hash,
                 from_rev,
                 limit,
                 response,
             }) => {
-                let result = read_stream(&conn, &stream_id, from_rev, limit, &cryptor);
+                let result = read_stream_tenant(&conn, &stream_id, tenant_hash, from_rev, limit, &cryptor);
                 let _ = response.send(result);
             }
             Some(ReadRequest::ReadGlobal {
@@ -479,9 +499,10 @@ pub async fn run_reader_pooled(
             }
             Some(ReadRequest::GetStreamRevision {
                 stream_id,
+                tenant_hash,
                 response,
             }) => {
-                let result = get_stream_revision(&conn, &stream_id);
+                let result = get_stream_revision_tenant(&conn, &stream_id, tenant_hash);
                 let _ = response.send(result);
             }
             Some(ReadRequest::Shutdown) | None => break,

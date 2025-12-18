@@ -32,6 +32,7 @@
 //! - [`StreamHash`]: Deterministic hash of [`StreamId`], used for fast lookups
 
 use std::fmt;
+use std::sync::Arc;
 
 // =============================================================================
 // Stream Identification
@@ -541,12 +542,12 @@ impl fmt::Display for StreamRev {
 /// let cmd_id = CommandId::new("550e8400-e29b-41d4-a716-446655440000");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CommandId(String);
+pub struct CommandId(Arc<str>);
 
 impl CommandId {
     /// Creates a new command ID.
     pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+        Self(Arc::<str>::from(id.into()))
     }
 
     /// Returns the string representation.
@@ -569,7 +570,7 @@ impl From<&str> for CommandId {
 
 impl From<String> for CommandId {
     fn from(s: String) -> Self {
-        Self(s)
+        Self(Arc::<str>::from(s))
     }
 }
 
@@ -806,6 +807,10 @@ pub struct StreamHeadEntry {
 /// result instead of re-processing. This ensures exactly-once semantics.
 #[derive(Debug, Clone)]
 pub struct CommandCacheEntry {
+    /// Tenant this command belongs to.
+    pub tenant_hash: TenantHash,
+    /// Stream this command wrote to.
+    pub stream_id: StreamId,
     /// First global position written by this command.
     pub first_pos: GlobalPos,
     /// Last global position written by this command.
