@@ -100,6 +100,7 @@ export declare class ProjectionRunner {
     startAll(): Promise<void>;
     /**
      * Spawns a worker for a projection module.
+     * If existingState is provided, preserves restart tracking state.
      */
     private spawnWorker;
     /**

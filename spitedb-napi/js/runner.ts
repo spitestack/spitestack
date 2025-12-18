@@ -61,6 +61,8 @@ interface WorkerState {
   lastCrash: number;
   /** Whether this worker is being terminated */
   terminating: boolean;
+  /** Whether a restart is currently in progress (prevents double-spawn) */
+  restarting?: boolean;
 }
 
 /**
@@ -150,8 +152,12 @@ export class ProjectionRunner {
 
   /**
    * Spawns a worker for a projection module.
+   * If existingState is provided, preserves restart tracking state.
    */
-  private async spawnWorker(modulePath: string): Promise<void> {
+  private async spawnWorker(
+    modulePath: string,
+    existingState?: { restartCount: number; lastCrash: number }
+  ): Promise<void> {
     // Get the path to worker.ts relative to this file
     const workerPath = new URL('./worker.ts', import.meta.url).pathname;
 
@@ -168,8 +174,8 @@ export class ProjectionRunner {
     const state: WorkerState = {
       worker,
       modulePath,
-      restartCount: 0,
-      lastCrash: 0,
+      restartCount: existingState?.restartCount ?? 0,
+      lastCrash: existingState?.lastCrash ?? 0,
       terminating: false,
     };
 
@@ -199,6 +205,10 @@ export class ProjectionRunner {
     const state = this.workers.get(modulePath);
     if (!state || state.terminating) return;
 
+    // Mark as restarting to prevent double-spawn from error+exit race
+    if (state.restarting) return;
+    state.restarting = true;
+
     const now = Date.now();
     const timeSinceLastCrash = now - state.lastCrash;
 
@@ -225,8 +235,11 @@ export class ProjectionRunner {
       return;
     }
 
-    // Respawn the worker
-    await this.spawnWorker(modulePath);
+    // Respawn the worker, preserving restart tracking state
+    await this.spawnWorker(modulePath, {
+      restartCount: state.restartCount,
+      lastCrash: state.lastCrash,
+    });
   }
 
   /**

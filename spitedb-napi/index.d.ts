@@ -72,8 +72,6 @@ export type SpiteDBNapi = SpiteDbNapi
 export declare class SpiteDbNapi {
   /** Opens a SpiteDB database at the given path. */
   static open(path: string): Promise<SpiteDbNapi>
-  /** Opens an in-memory SpiteDB database. */
-  static openInMemory(): Promise<SpiteDbNapi>
   /**
    * Appends events to a stream.
    *

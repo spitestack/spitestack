@@ -63,6 +63,11 @@ impl SpiteDBNapi {
         events: Vec<Buffer>,
         tenant: Option<String>,
     ) -> Result<AppendResultNapi> {
+        // Validate inputs to prevent panics
+        if events.is_empty() {
+            return Err(Error::from_reason("events array cannot be empty"));
+        }
+
         // Convert expected_rev:
         // -1 = any revision is ok
         // 0 = stream must not exist (StreamRev::NONE)
