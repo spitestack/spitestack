@@ -84,9 +84,12 @@ use tokio::time::{timeout, sleep};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 
-use crate::codec::{compute_checksum, current_time_ms, encode_batch_iter};
-use crate::crypto::{BatchCryptor, CIPHER_AES256GCM, CODEC_ZSTD_L1};
+use crate::codec::{compute_checksum, current_time_ms, decode_batch, encode_batch_iter};
+use crate::crypto::{BatchCryptor, CIPHER_AES256GCM, CODEC_ZSTD_L1, AES_GCM_NONCE_SIZE};
 use crate::error::{Error, Result};
+use crate::tombstones::{
+    load_stream_tombstones, load_tenant_tombstones, is_revision_tombstoned, CompactionStats,
+};
 use crate::types::{
     AppendCommand, AppendResult, CollisionSlot, CommandCacheEntry, CommandId,
     DeleteStreamCommand, DeleteStreamResult, DeleteTenantCommand, DeleteTenantResult, GlobalPos,
@@ -467,6 +470,16 @@ pub enum WriteRequest {
     DeleteTenant {
         command: DeleteTenantCommand,
         response: oneshot::Sender<Result<DeleteTenantResult>>,
+    },
+
+    /// Execute compaction of tombstoned events.
+    ///
+    /// This physically deletes events marked by tombstones by rewriting
+    /// affected batches. Sent by the background compaction task.
+    Compact {
+        /// Maximum number of batches to process (for incremental compaction)
+        max_batches: Option<usize>,
+        response: oneshot::Sender<Result<CompactionStats>>,
     },
 
     /// Shutdown the writer.
@@ -1534,6 +1547,352 @@ impl BatchWriter {
             deleted_ms: deleted_ms as u64,
         })
     }
+
+    // =========================================================================
+    // Compaction (Physical Deletion of Tombstoned Events)
+    // =========================================================================
+
+    /// Executes compaction of tombstoned events.
+    ///
+    /// This method:
+    /// 1. Finds batches affected by tombstones (stream or tenant)
+    /// 2. Rewrites each batch, excluding tombstoned events
+    /// 3. Updates event_index byte offsets
+    /// 4. Deletes batches where all events were tombstoned
+    /// 5. Cleans up fully-compacted tombstone records
+    ///
+    /// # Arguments
+    ///
+    /// * `max_batches` - Optional limit on batches to process (for incremental compaction)
+    ///
+    /// # Returns
+    ///
+    /// Statistics about what was compacted.
+    pub fn execute_compaction(&mut self, max_batches: Option<usize>) -> Result<CompactionStats> {
+        let mut stats = CompactionStats::default();
+
+        // 1. Find affected batches from stream tombstones
+        let stream_affected = self.find_stream_tombstoned_batches()?;
+
+        // 2. Find affected batches from tenant tombstones
+        let tenant_affected = self.find_tenant_tombstoned_batches()?;
+
+        // 3. Merge and deduplicate batch IDs
+        let mut batch_ids: Vec<i64> = stream_affected
+            .into_iter()
+            .chain(tenant_affected)
+            .collect();
+        batch_ids.sort();
+        batch_ids.dedup();
+
+        // 4. Limit if specified (for incremental compaction)
+        if let Some(max) = max_batches {
+            batch_ids.truncate(max);
+        }
+
+        if batch_ids.is_empty() {
+            return Ok(stats);
+        }
+
+        // 5. Process each batch
+        for batch_id in batch_ids {
+            match self.compact_single_batch(batch_id) {
+                Ok((events_deleted, bytes_reclaimed)) => {
+                    if events_deleted > 0 {
+                        stats.batches_rewritten += 1;
+                        stats.events_deleted += events_deleted;
+                        stats.bytes_reclaimed += bytes_reclaimed;
+                    }
+                }
+                Err(e) => {
+                    // Log and continue with other batches
+                    eprintln!("[spitedb] compact batch {} failed: {}", batch_id, e);
+                }
+            }
+        }
+
+        // 6. Clean up tombstones that no longer reference any events
+        stats.tombstones_removed = self.cleanup_exhausted_tombstones()?;
+
+        Ok(stats)
+    }
+
+    /// Finds batch IDs containing events affected by stream tombstones.
+    fn find_stream_tombstoned_batches(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT e.batch_id
+             FROM event_index e
+             JOIN tombstones t ON e.stream_hash = t.stream_hash
+                              AND e.collision_slot = t.collision_slot
+                              AND e.tenant_hash = t.tenant_hash
+             WHERE e.stream_rev >= t.from_rev
+               AND e.stream_rev <= t.to_rev",
+        )?;
+
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+
+        Ok(ids)
+    }
+
+    /// Finds batch IDs containing events from tombstoned tenants.
+    fn find_tenant_tombstoned_batches(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT e.batch_id
+             FROM event_index e
+             JOIN tenant_tombstones t ON e.tenant_hash = t.tenant_hash",
+        )?;
+
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+
+        Ok(ids)
+    }
+
+    /// Compacts a single batch by rewriting it without tombstoned events.
+    ///
+    /// Returns (events_deleted, bytes_reclaimed).
+    fn compact_single_batch(&mut self, batch_id: i64) -> Result<(usize, usize)> {
+        // 1. Load batch metadata
+        let (base_pos, nonce, old_data): (i64, Vec<u8>, Vec<u8>) = self.conn.query_row(
+            "SELECT base_pos, nonce, data FROM batches WHERE batch_id = ?",
+            [batch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        let old_size = old_data.len();
+
+        // 2. Decode the batch
+        let nonce_arr: [u8; AES_GCM_NONCE_SIZE] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Encryption("invalid nonce length".into()))?;
+        let decrypted = decode_batch(&old_data, &nonce_arr, base_pos, &self.cryptor)?;
+
+        // 3. Load tenant tombstones once
+        let tenant_tombstones = load_tenant_tombstones(&self.conn)?;
+
+        // 4. Load event_index entries and filter tombstoned events
+        let events_to_keep = self.load_events_for_batch_filtered(batch_id, &decrypted, &tenant_tombstones)?;
+
+        // 5. Count deleted events
+        let original_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM event_index WHERE batch_id = ?",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        let events_deleted = (original_count as usize).saturating_sub(events_to_keep.len());
+
+        if events_deleted == 0 {
+            // No tombstoned events in this batch
+            return Ok((0, 0));
+        }
+
+        if events_to_keep.is_empty() {
+            // All events were tombstoned - delete the entire batch
+            self.delete_batch_completely(batch_id)?;
+            return Ok((events_deleted, old_size));
+        }
+
+        // 6. Rewrite the batch with remaining events
+        self.rewrite_batch(batch_id, base_pos, &events_to_keep)?;
+
+        Ok((events_deleted, old_size))
+    }
+
+    /// Loads events from a batch, filtering out tombstoned ones.
+    fn load_events_for_batch_filtered(
+        &self,
+        batch_id: i64,
+        decrypted: &[u8],
+        tenant_tombstones: &std::collections::HashSet<TenantHash>,
+    ) -> Result<Vec<EventToKeep>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT global_pos, byte_offset, byte_len, stream_hash, tenant_hash,
+                    collision_slot, stream_rev
+             FROM event_index
+             WHERE batch_id = ?
+             ORDER BY global_pos",
+        )?;
+
+        let mut events_to_keep = Vec::new();
+        let rows = stmt.query_map([batch_id], |row| {
+            Ok(EventIndexRow {
+                global_pos: row.get(0)?,
+                byte_offset: row.get::<_, i64>(1)? as usize,
+                byte_len: row.get::<_, i64>(2)? as usize,
+                stream_hash: StreamHash::from_raw(row.get(3)?),
+                tenant_hash: TenantHash::from_raw(row.get(4)?),
+                collision_slot: CollisionSlot::from_raw(row.get::<_, i64>(5)? as u16),
+                stream_rev: StreamRev::from_raw(row.get::<_, i64>(6)? as u64),
+            })
+        })?;
+
+        for row_result in rows {
+            let row = row_result?;
+
+            // Check tenant tombstone
+            if tenant_tombstones.contains(&row.tenant_hash) {
+                continue; // Skip - tenant is tombstoned
+            }
+
+            // Check stream tombstone
+            let stream_tombstones = load_stream_tombstones(
+                &self.conn,
+                row.stream_hash,
+                row.collision_slot,
+                row.tenant_hash,
+            )?;
+
+            if is_revision_tombstoned(&stream_tombstones, row.stream_rev) {
+                continue; // Skip - revision is tombstoned
+            }
+
+            // Keep this event
+            let end = row.byte_offset + row.byte_len;
+            if end > decrypted.len() {
+                return Err(Error::Schema(format!(
+                    "corrupt event_index: offset {} + len {} exceeds batch size {}",
+                    row.byte_offset, row.byte_len, decrypted.len()
+                )));
+            }
+            let data = decrypted[row.byte_offset..end].to_vec();
+
+            events_to_keep.push(EventToKeep {
+                global_pos: row.global_pos,
+                stream_hash: row.stream_hash,
+                tenant_hash: row.tenant_hash,
+                collision_slot: row.collision_slot,
+                stream_rev: row.stream_rev,
+                data,
+            });
+        }
+
+        Ok(events_to_keep)
+    }
+
+    /// Rewrites a batch with only the events that should be kept.
+    fn rewrite_batch(&mut self, batch_id: i64, base_pos: i64, events: &[EventToKeep]) -> Result<()> {
+        let now_ms = current_time_ms();
+
+        // 1. Encode new batch from kept events
+        let event_iter = events.iter().map(|e| e.data.as_slice());
+        let (new_data, new_nonce, new_offsets) = encode_batch_iter(event_iter, base_pos, &self.cryptor)?;
+        let checksum = compute_checksum(&new_data);
+
+        // 2. Begin transaction
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+
+        // 3. Delete old event_index entries for this batch
+        self.conn.execute("DELETE FROM event_index WHERE batch_id = ?", [batch_id])?;
+
+        // 4. Update batch data
+        self.conn.execute(
+            "UPDATE batches SET event_count = ?, created_ms = ?, nonce = ?, checksum = ?, data = ?
+             WHERE batch_id = ?",
+            params![
+                events.len() as i64,
+                now_ms as i64,
+                new_nonce.as_slice(),
+                checksum.as_slice(),
+                new_data.as_slice(),
+                batch_id,
+            ],
+        )?;
+
+        // 5. Insert new event_index entries with updated offsets
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO event_index (global_pos, batch_id, byte_offset, byte_len,
+                                      stream_hash, tenant_hash, collision_slot, stream_rev)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )?;
+
+        for (i, event) in events.iter().enumerate() {
+            let (offset, len) = new_offsets[i];
+            stmt.execute(params![
+                event.global_pos,
+                batch_id,
+                offset as i64,
+                len as i64,
+                event.stream_hash.as_raw(),
+                event.tenant_hash.as_raw(),
+                event.collision_slot.as_raw() as i64,
+                event.stream_rev.as_raw() as i64,
+            ])?;
+        }
+
+        drop(stmt);
+
+        // 6. Commit
+        self.conn.execute("COMMIT", [])?;
+
+        Ok(())
+    }
+
+    /// Deletes a batch entirely when all events are tombstoned.
+    fn delete_batch_completely(&mut self, batch_id: i64) -> Result<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        self.conn.execute("DELETE FROM event_index WHERE batch_id = ?", [batch_id])?;
+        self.conn.execute("DELETE FROM batches WHERE batch_id = ?", [batch_id])?;
+        self.conn.execute("COMMIT", [])?;
+        Ok(())
+    }
+
+    /// Cleans up tombstone records that no longer reference any events.
+    fn cleanup_exhausted_tombstones(&mut self) -> Result<usize> {
+        // Delete stream tombstones where no events remain in the range
+        let deleted_stream = self.conn.execute(
+            "DELETE FROM tombstones
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM event_index e
+                 WHERE e.stream_hash = tombstones.stream_hash
+                   AND e.collision_slot = tombstones.collision_slot
+                   AND e.tenant_hash = tombstones.tenant_hash
+                   AND e.stream_rev >= tombstones.from_rev
+                   AND e.stream_rev <= tombstones.to_rev
+             )",
+            [],
+        )?;
+
+        // Delete tenant tombstones where no events remain for that tenant
+        let deleted_tenant = self.conn.execute(
+            "DELETE FROM tenant_tombstones
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM event_index e
+                 WHERE e.tenant_hash = tenant_tombstones.tenant_hash
+             )",
+            [],
+        )?;
+
+        Ok(deleted_stream + deleted_tenant)
+    }
+}
+
+// =============================================================================
+// Compaction Helper Types
+// =============================================================================
+
+/// Row from event_index during compaction.
+struct EventIndexRow {
+    global_pos: i64,
+    byte_offset: usize,
+    byte_len: usize,
+    stream_hash: StreamHash,
+    tenant_hash: TenantHash,
+    collision_slot: CollisionSlot,
+    stream_rev: StreamRev,
+}
+
+/// Event to keep during compaction (intermediate structure).
+struct EventToKeep {
+    global_pos: i64,
+    stream_hash: StreamHash,
+    tenant_hash: TenantHash,
+    collision_slot: CollisionSlot,
+    stream_rev: StreamRev,
+    data: Vec<u8>,
 }
 
 // =============================================================================
@@ -1758,6 +2117,43 @@ impl BatchWriterHandle {
         drop(permits);
         result
     }
+
+    /// Triggers compaction of tombstoned events.
+    ///
+    /// # Background Compaction
+    ///
+    /// This method physically deletes events that have been logically deleted
+    /// via tombstones. It's typically called by a background task, not directly
+    /// by application code.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_batches` - Maximum batches to process per invocation. Use `Some(100)`
+    ///   for incremental compaction that doesn't block writes for too long.
+    ///
+    /// # Returns
+    ///
+    /// Statistics about what was compacted: batches rewritten, events deleted,
+    /// tombstones removed, and bytes reclaimed.
+    pub async fn compact(&self, max_batches: Option<usize>) -> Result<CompactionStats> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        // Compaction can take a while, use a longer timeout (5 minutes)
+        let compaction_timeout = Duration::from_secs(300);
+
+        timeout(compaction_timeout, self.tx.send(WriteRequest::Compact {
+            max_batches,
+            response: response_tx,
+        }))
+        .await
+        .map_err(|_| Error::Timeout("timeout sending compaction request".into()))?
+        .map_err(|_| Error::Schema("writer has shut down".into()))?;
+
+        timeout(compaction_timeout, response_rx)
+            .await
+            .map_err(|_| Error::Timeout("timeout waiting for compaction response".into()))?
+            .map_err(|_| Error::Schema("writer dropped response".into()))?
+    }
 }
 
 // =============================================================================
@@ -1888,6 +2284,17 @@ pub async fn run_batch_writer(
             Ok(Some(WriteRequest::DeleteTenant { command, response })) => {
                 // Delete tenant requests are handled immediately
                 let result = writer.execute_delete_tenant(command);
+                let _ = response.send(result);
+            }
+            Ok(Some(WriteRequest::Compact { max_batches, response })) => {
+                // Compaction requests are handled immediately (not batched)
+                // Flush any pending batch first to ensure we compact latest state
+                if !batch.is_empty() {
+                    writer.execute_batch(std::mem::take(&mut batch));
+                    batch_start = None;
+                    batch_bytes = 0;
+                }
+                let result = writer.execute_compaction(max_batches);
                 let _ = response.send(result);
             }
             Ok(Some(WriteRequest::Shutdown)) => {

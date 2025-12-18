@@ -100,6 +100,13 @@ const MIN_READ_THREADS: usize = 1;
 /// Maximum number of reader threads.
 const MAX_READ_THREADS: usize = 16;
 
+/// Background compaction interval (5 minutes).
+const COMPACTION_INTERVAL_SECS: u64 = 5 * 60;
+
+/// Maximum batches to process per compaction cycle.
+/// Keeps compaction incremental to avoid blocking writes for too long.
+const COMPACTION_MAX_BATCHES_PER_CYCLE: usize = 100;
+
 // =============================================================================
 // SpiteDB - The Main Async Handle
 // =============================================================================
@@ -272,12 +279,54 @@ impl SpiteDB {
             reader_handles.push(handle);
         }
 
-        Ok(Self {
+        let db = Self {
             writer,
             read_tx,
             reader_handles: Arc::new(Mutex::new(reader_handles)),
             reader_count,
-        })
+        };
+
+        // Spawn background compaction task
+        db.spawn_compaction_task();
+
+        Ok(db)
+    }
+
+    /// Spawns the background compaction task.
+    ///
+    /// This task runs periodically (every 5 minutes) to physically delete
+    /// events that have been logically deleted via tombstones.
+    fn spawn_compaction_task(&self) {
+        let writer = self.writer.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_secs(COMPACTION_INTERVAL_SECS)
+            );
+
+            // Skip the first immediate tick
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+
+                match writer.compact(Some(COMPACTION_MAX_BATCHES_PER_CYCLE)).await {
+                    Ok(stats) => {
+                        if stats.batches_rewritten > 0 || stats.tombstones_removed > 0 {
+                            eprintln!(
+                                "[spitedb] background compaction: {} batches rewritten, {} events deleted, {} tombstones removed, {} bytes reclaimed",
+                                stats.batches_rewritten,
+                                stats.events_deleted,
+                                stats.tombstones_removed,
+                                stats.bytes_reclaimed,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[spitedb] background compaction failed: {}", e);
+                    }
+                }
+            }
+        });
     }
 
     /// Returns the number of reader threads in the pool.
