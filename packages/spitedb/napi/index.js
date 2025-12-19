@@ -37,7 +37,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./spitedb.android-arm64.node')
           } else {
-            nativeBinding = require('@spitedb/napi-android-arm64')
+            nativeBinding = require('@spitestack/db-android-arm64')
           }
         } catch (e) {
           loadError = e
@@ -49,7 +49,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./spitedb.android-arm-eabi.node')
           } else {
-            nativeBinding = require('@spitedb/napi-android-arm-eabi')
+            nativeBinding = require('@spitestack/db-android-arm-eabi')
           }
         } catch (e) {
           loadError = e
@@ -69,7 +69,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./spitedb.win32-x64-msvc.node')
           } else {
-            nativeBinding = require('@spitedb/napi-win32-x64-msvc')
+            nativeBinding = require('@spitestack/db-win32-x64-msvc')
           }
         } catch (e) {
           loadError = e
@@ -83,7 +83,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./spitedb.win32-ia32-msvc.node')
           } else {
-            nativeBinding = require('@spitedb/napi-win32-ia32-msvc')
+            nativeBinding = require('@spitestack/db-win32-ia32-msvc')
           }
         } catch (e) {
           loadError = e
@@ -97,7 +97,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./spitedb.win32-arm64-msvc.node')
           } else {
-            nativeBinding = require('@spitedb/napi-win32-arm64-msvc')
+            nativeBinding = require('@spitestack/db-win32-arm64-msvc')
           }
         } catch (e) {
           loadError = e
@@ -113,7 +113,7 @@ switch (platform) {
       if (localFileExisted) {
         nativeBinding = require('./spitedb.darwin-universal.node')
       } else {
-        nativeBinding = require('@spitedb/napi-darwin-universal')
+        nativeBinding = require('@spitestack/db-darwin-universal')
       }
       break
     } catch {}
@@ -124,7 +124,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./spitedb.darwin-x64.node')
           } else {
-            nativeBinding = require('@spitedb/napi-darwin-x64')
+            nativeBinding = require('@spitestack/db-darwin-x64')
           }
         } catch (e) {
           loadError = e
@@ -138,7 +138,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./spitedb.darwin-arm64.node')
           } else {
-            nativeBinding = require('@spitedb/napi-darwin-arm64')
+            nativeBinding = require('@spitestack/db-darwin-arm64')
           }
         } catch (e) {
           loadError = e
@@ -157,7 +157,7 @@ switch (platform) {
       if (localFileExisted) {
         nativeBinding = require('./spitedb.freebsd-x64.node')
       } else {
-        nativeBinding = require('@spitedb/napi-freebsd-x64')
+        nativeBinding = require('@spitestack/db-freebsd-x64')
       }
     } catch (e) {
       loadError = e
@@ -174,7 +174,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./spitedb.linux-x64-musl.node')
             } else {
-              nativeBinding = require('@spitedb/napi-linux-x64-musl')
+              nativeBinding = require('@spitestack/db-linux-x64-musl')
             }
           } catch (e) {
             loadError = e
@@ -187,7 +187,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./spitedb.linux-x64-gnu.node')
             } else {
-              nativeBinding = require('@spitedb/napi-linux-x64-gnu')
+              nativeBinding = require('@spitestack/db-linux-x64-gnu')
             }
           } catch (e) {
             loadError = e
@@ -203,7 +203,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./spitedb.linux-arm64-musl.node')
             } else {
-              nativeBinding = require('@spitedb/napi-linux-arm64-musl')
+              nativeBinding = require('@spitestack/db-linux-arm64-musl')
             }
           } catch (e) {
             loadError = e
@@ -216,7 +216,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./spitedb.linux-arm64-gnu.node')
             } else {
-              nativeBinding = require('@spitedb/napi-linux-arm64-gnu')
+              nativeBinding = require('@spitestack/db-linux-arm64-gnu')
             }
           } catch (e) {
             loadError = e
@@ -232,7 +232,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./spitedb.linux-arm-musleabihf.node')
             } else {
-              nativeBinding = require('@spitedb/napi-linux-arm-musleabihf')
+              nativeBinding = require('@spitestack/db-linux-arm-musleabihf')
             }
           } catch (e) {
             loadError = e
@@ -245,7 +245,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./spitedb.linux-arm-gnueabihf.node')
             } else {
-              nativeBinding = require('@spitedb/napi-linux-arm-gnueabihf')
+              nativeBinding = require('@spitestack/db-linux-arm-gnueabihf')
             }
           } catch (e) {
             loadError = e
@@ -261,7 +261,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./spitedb.linux-riscv64-musl.node')
             } else {
-              nativeBinding = require('@spitedb/napi-linux-riscv64-musl')
+              nativeBinding = require('@spitestack/db-linux-riscv64-musl')
             }
           } catch (e) {
             loadError = e
@@ -274,7 +274,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./spitedb.linux-riscv64-gnu.node')
             } else {
-              nativeBinding = require('@spitedb/napi-linux-riscv64-gnu')
+              nativeBinding = require('@spitestack/db-linux-riscv64-gnu')
             }
           } catch (e) {
             loadError = e
@@ -289,7 +289,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./spitedb.linux-s390x-gnu.node')
           } else {
-            nativeBinding = require('@spitedb/napi-linux-s390x-gnu')
+            nativeBinding = require('@spitestack/db-linux-s390x-gnu')
           }
         } catch (e) {
           loadError = e
@@ -313,3 +313,6 @@ if (!nativeBinding) {
 const { SpiteDbNapi } = nativeBinding
 
 module.exports.SpiteDbNapi = SpiteDbNapi
+
+// Default tenant for single-tenant applications
+module.exports.DEFAULT_TENANT = "default"

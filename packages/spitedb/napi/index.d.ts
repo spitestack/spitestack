@@ -100,15 +100,27 @@ export declare class SpiteDbNapi {
    * @param commandId - Unique command ID for idempotency
    * @param expectedRev - Expected revision: -1 for "any", 0 for "stream must not exist", >0 for exact revision
    * @param events - Array of event data buffers
-   * @param tenant - Optional tenant ID (defaults to "default" for single-tenant apps)
+   * @param tenant - Tenant ID (use DEFAULT_TENANT for single-tenant apps)
    */
-  append(streamId: string, commandId: string, expectedRev: number, events: Array<Buffer>, tenant?: string | undefined | null): Promise<AppendResultNapi>
-  /** Reads events from a stream. */
-  readStream(streamId: string, fromRev: number, limit: number): Promise<Array<EventNapi>>
+  append(streamId: string, commandId: string, expectedRev: number, events: Array<Buffer>, tenant: string): Promise<AppendResultNapi>
+  /**
+   * Reads events from a stream.
+   *
+   * @param streamId - The stream to read from
+   * @param fromRev - Starting revision (0 for beginning)
+   * @param limit - Maximum number of events to return
+   * @param tenant - Tenant ID (use DEFAULT_TENANT for single-tenant apps)
+   */
+  readStream(streamId: string, fromRev: number, limit: number, tenant: string): Promise<Array<EventNapi>>
   /** Reads events from the global log. */
   readGlobal(fromPos: number, limit: number): Promise<Array<EventNapi>>
-  /** Gets the current revision of a stream. */
-  getStreamRevision(streamId: string): Promise<number>
+  /**
+   * Gets the current revision of a stream.
+   *
+   * @param streamId - The stream to get revision for
+   * @param tenant - Tenant ID (use DEFAULT_TENANT for single-tenant apps)
+   */
+  getStreamRevision(streamId: string, tenant: string): Promise<number>
   /**
    * Initializes the projection registry.
    *
@@ -161,3 +173,6 @@ export type {
 } from './js/types';
 
 export { projection, createProjectionProxy, ProjectionRunner } from './js/index';
+
+/** Default tenant ID for single-tenant applications */
+export const DEFAULT_TENANT: string;

@@ -53,7 +53,7 @@ impl SpiteDBNapi {
     /// @param commandId - Unique command ID for idempotency
     /// @param expectedRev - Expected revision: -1 for "any", 0 for "stream must not exist", >0 for exact revision
     /// @param events - Array of event data buffers
-    /// @param tenant - Optional tenant ID (defaults to "default" for single-tenant apps)
+    /// @param tenant - Tenant ID (use DEFAULT_TENANT for single-tenant apps)
     #[napi]
     pub async fn append(
         &self,
@@ -61,7 +61,7 @@ impl SpiteDBNapi {
         command_id: String,
         expected_rev: i64,
         events: Vec<Buffer>,
-        tenant: Option<String>,
+        tenant: String,
     ) -> Result<AppendResultNapi> {
         // Validate inputs to prevent panics
         if events.is_empty() {
@@ -84,8 +84,7 @@ impl SpiteDBNapi {
             .map(|buf| EventData::new(buf.to_vec()))
             .collect();
 
-        // Use provided tenant or default to "default"
-        let tenant_obj = tenant.map(Tenant::new).unwrap_or_else(Tenant::default_tenant);
+        let tenant_obj = Tenant::new(tenant);
 
         let command = AppendCommand::new_with_tenant(
             CommandId::new(command_id),
@@ -105,16 +104,23 @@ impl SpiteDBNapi {
     }
 
     /// Reads events from a stream.
+    ///
+    /// @param streamId - The stream to read from
+    /// @param fromRev - Starting revision (0 for beginning)
+    /// @param limit - Maximum number of events to return
+    /// @param tenant - Tenant ID (use DEFAULT_TENANT for single-tenant apps)
     #[napi]
     pub async fn read_stream(
         &self,
         stream_id: String,
         from_rev: i64,
         limit: i64,
+        tenant: String,
     ) -> Result<Vec<EventNapi>> {
+        let tenant_obj = Tenant::new(tenant);
         let events = self
             .inner
-            .read_stream(stream_id, StreamRev::from_raw(from_rev as u64), limit as usize)
+            .read_stream_tenant(stream_id, tenant_obj, StreamRev::from_raw(from_rev as u64), limit as usize)
             .await
             .map_err(|e| Error::from_reason(format!("Read failed: {}", e)))?;
 
@@ -134,11 +140,15 @@ impl SpiteDBNapi {
     }
 
     /// Gets the current revision of a stream.
+    ///
+    /// @param streamId - The stream to get revision for
+    /// @param tenant - Tenant ID (use DEFAULT_TENANT for single-tenant apps)
     #[napi]
-    pub async fn get_stream_revision(&self, stream_id: String) -> Result<i64> {
+    pub async fn get_stream_revision(&self, stream_id: String, tenant: String) -> Result<i64> {
+        let tenant_obj = Tenant::new(tenant);
         let rev = self
             .inner
-            .get_stream_revision(stream_id)
+            .get_stream_revision_tenant(stream_id, tenant_obj)
             .await
             .map_err(|e| Error::from_reason(format!("Failed to get revision: {}", e)))?;
 

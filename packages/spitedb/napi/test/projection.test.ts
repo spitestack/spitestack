@@ -3,7 +3,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { SpiteDbNapi } from '../index.js';
+import { SpiteDbNapi, DEFAULT_TENANT } from '../index.js';
 import { projection, ProjectionRunner } from '../js/index';
 import { randomUUID } from 'crypto';
 import { mkdtemp, rm } from 'fs/promises';
@@ -31,7 +31,8 @@ describe('Projection System', () => {
       'user-123',
       randomUUID(),
       0, // Stream must not exist
-      [Buffer.from(JSON.stringify({ type: 'UserCreated', name: 'Alice' }))]
+      [Buffer.from(JSON.stringify({ type: 'UserCreated', name: 'Alice' }))],
+      DEFAULT_TENANT
     );
 
     expect(result.firstPos).toBe(1);
@@ -48,7 +49,8 @@ describe('Projection System', () => {
       [
         Buffer.from(JSON.stringify({ type: 'UserLoggedIn' })),
         Buffer.from(JSON.stringify({ type: 'UserLoggedIn' })),
-      ]
+      ],
+      DEFAULT_TENANT
     );
 
     expect(result.firstRev).toBe(2);
@@ -56,7 +58,7 @@ describe('Projection System', () => {
   });
 
   test('should read events from stream', async () => {
-    const events = await db.readStream('user-123', 0, 100);
+    const events = await db.readStream('user-123', 0, 100, DEFAULT_TENANT);
 
     expect(events.length).toBe(3);
     expect(events[0].streamRev).toBe(1);
