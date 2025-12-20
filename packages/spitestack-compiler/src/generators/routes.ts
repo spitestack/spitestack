@@ -1,13 +1,25 @@
-import type { GeneratedFile } from "../types";
+import type { GeneratedFile, CompilerConfig } from "../types";
 
 type CommandPolicy = {
   scope: "public" | "auth" | "internal";
   roles?: string[];
 };
 
+export interface RoutesGeneratorOptions {
+  commandPolicies: Map<string, CommandPolicy>;
+  appImportPath?: string | null;
+  apiVersioning?: {
+    enabled: boolean;
+    currentVersion?: string;
+    frozenVersions?: string[];
+    latestAlias?: string;
+  };
+}
+
 export function generateRoutesFile(
   commandPolicies: Map<string, CommandPolicy>,
-  appImportPath?: string | null
+  appImportPath?: string | null,
+  apiVersioning?: RoutesGeneratorOptions["apiVersioning"]
 ): GeneratedFile {
   const appImport = appImportPath ? `import app from "${appImportPath}";` : "";
   const appConfigInit = appImportPath
@@ -75,6 +87,23 @@ const DEFAULT_BASE_PATH = "/api";
 const DEFAULT_PUBLIC_SESSION_HEADER = "x-session-id";
 const DEFAULT_PUBLIC_SESSION_REQUIRED = true;
 const DEFAULT_PUBLIC_SESSION_COOKIE = "spitestack_session";
+${apiVersioning?.enabled ? `
+// API Versioning
+const API_VERSIONING_ENABLED = true;
+const CURRENT_API_VERSION = "${apiVersioning.currentVersion ?? "v1"}";
+const SUPPORTED_API_VERSIONS = new Set([${
+  apiVersioning.frozenVersions?.length
+    ? [...apiVersioning.frozenVersions, apiVersioning.currentVersion ?? "v1"].map(v => `"${v}"`).join(", ")
+    : `"${apiVersioning.currentVersion ?? "v1"}"`
+}]);
+${apiVersioning.latestAlias ? `const LATEST_API_ALIAS = "${apiVersioning.latestAlias}";` : "const LATEST_API_ALIAS: string | null = null;"}
+` : `
+// API Versioning disabled
+const API_VERSIONING_ENABLED = false;
+const CURRENT_API_VERSION = "v1";
+const SUPPORTED_API_VERSIONS = new Set<string>();
+const LATEST_API_ALIAS: string | null = null;
+`}
 
 export interface RouteOptions {
   db: SpiteDbNapi;
@@ -101,9 +130,35 @@ export function createCommandHandler(options: RouteOptions) {
     }
 
     const path = url.pathname.slice(basePath.length);
-    const [aggregate, command] = path.split("/").filter(Boolean);
-    if (!aggregate || !command || path.split("/").filter(Boolean).length !== 2) {
-      return new Response("Not found", { status: 404 });
+    const segments = path.split("/").filter(Boolean);
+
+    // Handle API versioning
+    let apiVersion: string | null = null;
+    let aggregate: string;
+    let command: string;
+
+    if (API_VERSIONING_ENABLED) {
+      // Check for version prefix (e.g., /v1/todo/create)
+      if (segments[0]?.startsWith("v") && /^v\\d+$/.test(segments[0])) {
+        apiVersion = segments[0];
+        if (!SUPPORTED_API_VERSIONS.has(apiVersion)) {
+          return new Response(\`Unsupported API version: \${apiVersion}\`, { status: 400 });
+        }
+        [, aggregate, command] = segments;
+      } else {
+        // No version prefix - use current version
+        [aggregate, command] = segments;
+        apiVersion = CURRENT_API_VERSION;
+      }
+
+      if (!aggregate || !command) {
+        return new Response("Not found", { status: 404 });
+      }
+    } else {
+      [aggregate, command] = segments;
+      if (!aggregate || !command || segments.length !== 2) {
+        return new Response("Not found", { status: 404 });
+      }
     }
 
     if (req.method !== "POST") {

@@ -4,7 +4,20 @@ import type ts from "typescript";
 // Configuration Types
 // ============================================================================
 
+/**
+ * Mode determines how schema evolution and API contracts are handled.
+ * - "greenfield": No lock files, schemas can change freely. Use during early development.
+ * - "production": Lock files enforced. Breaking changes require upcasters/version bumps.
+ */
+export type SpiteStackMode = "greenfield" | "production";
+
 export interface CompilerConfig {
+  /**
+   * Mode determines schema evolution behavior.
+   * - "greenfield": No lock files, iterate freely (default)
+   * - "production": Lock files enforced, breaking changes require upcasters
+   */
+  mode: SpiteStackMode;
   /** Directory containing aggregate classes */
   domainDir: string;
   /** Output directory for generated code */
@@ -30,6 +43,20 @@ export interface CompilerConfig {
     publicSessionRequired: boolean;
     publicTenantId?: string;
   };
+  /** Schema evolution options (relevant in production mode) */
+  schemaEvolution: {
+    /** Directory for upcaster files */
+    upcasterDir: string;
+  };
+  /** API versioning options (opt-in for API products) */
+  api: {
+    /** Enable API contract versioning (default: false) */
+    versioning: boolean;
+    /** Optional alias for latest version (e.g., "/api") */
+    latestAlias?: string;
+    /** Warn when deprecated API versions are used */
+    deprecationWarnings: boolean;
+  };
   /** App config path if using spitestack.app */
   appPath?: string | null;
   /** Raw app config */
@@ -38,12 +65,15 @@ export interface CompilerConfig {
   registrations?: SpiteStackRegistration[] | null;
 }
 
-export type PartialConfig = Partial<Omit<CompilerConfig, "generate" | "diagnostics">> & {
+export type PartialConfig = Partial<Omit<CompilerConfig, "generate" | "diagnostics" | "schemaEvolution" | "api">> & {
   generate?: Partial<CompilerConfig["generate"]>;
   diagnostics?: Partial<CompilerConfig["diagnostics"]>;
+  schemaEvolution?: Partial<CompilerConfig["schemaEvolution"]>;
+  api?: Partial<CompilerConfig["api"]>;
 };
 
 export interface SpiteStackAppConfig {
+  mode?: SpiteStackMode;
   domainDir?: string;
   outDir?: string;
   include?: string[];
@@ -62,6 +92,14 @@ export interface SpiteStackAppConfig {
     publicSessionHeader?: string;
     publicSessionRequired?: boolean;
     publicTenantId?: string;
+  };
+  schemaEvolution?: {
+    upcasterDir?: string;
+  };
+  api?: {
+    versioning?: boolean;
+    latestAlias?: string;
+    deprecationWarnings?: boolean;
   };
   auth?: unknown;
 }

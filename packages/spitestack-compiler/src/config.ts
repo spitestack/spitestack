@@ -8,6 +8,7 @@ import type {
 } from "./types";
 
 const DEFAULT_CONFIG: CompilerConfig = {
+  mode: "greenfield",
   domainDir: "./src/domain/aggregates",
   outDir: "./.spitestack/generated",
   include: ["**/*.ts"],
@@ -27,13 +28,14 @@ const DEFAULT_CONFIG: CompilerConfig = {
     publicSessionRequired: true,
     publicTenantId: undefined,
   },
+  schemaEvolution: {
+    upcasterDir: "./.spitestack/upcasters",
+  },
+  api: {
+    versioning: false,
+    deprecationWarnings: true,
+  },
 };
-
-const CONFIG_FILES = [
-  "spitestack.config.ts",
-  "spitestack.config.js",
-  "spitestack.config.mjs",
-];
 
 const APP_FILES = [
   "spitestack.app.ts",
@@ -45,18 +47,11 @@ const APP_FILES = [
 ];
 
 /**
- * Define a SpiteStack compiler configuration.
- * Use this in your spitestack.config.ts file.
- */
-export function defineConfig(config: PartialConfig): PartialConfig {
-  return config;
-}
-
-/**
  * Merge partial config with defaults
  */
 function mergeConfig(partial: PartialConfig): CompilerConfig {
   return {
+    mode: partial.mode ?? DEFAULT_CONFIG.mode,
     domainDir: partial.domainDir ?? DEFAULT_CONFIG.domainDir,
     outDir: partial.outDir ?? DEFAULT_CONFIG.outDir,
     include: partial.include ?? DEFAULT_CONFIG.include,
@@ -78,19 +73,26 @@ function mergeConfig(partial: PartialConfig): CompilerConfig {
         partial.routes?.publicSessionRequired ?? DEFAULT_CONFIG.routes.publicSessionRequired,
       publicTenantId: partial.routes?.publicTenantId ?? DEFAULT_CONFIG.routes.publicTenantId,
     },
+    schemaEvolution: {
+      upcasterDir: partial.schemaEvolution?.upcasterDir ?? DEFAULT_CONFIG.schemaEvolution.upcasterDir,
+    },
+    api: {
+      versioning: partial.api?.versioning ?? DEFAULT_CONFIG.api.versioning,
+      latestAlias: partial.api?.latestAlias ?? DEFAULT_CONFIG.api.latestAlias,
+      deprecationWarnings: partial.api?.deprecationWarnings ?? DEFAULT_CONFIG.api.deprecationWarnings,
+    },
   };
 }
 
 /**
- * Find and load the config file from the current directory or parents
+ * Find and load the App entrypoint from the current directory or parents
  */
 export async function loadConfig(cwd: string = process.cwd()): Promise<{
   config: CompilerConfig;
   configPath: string | null;
 }> {
-  // Search for app file first
+  // Search for app file
   let searchDir = cwd;
-  let configPath: string | null = null;
   let appPath: string | null = null;
 
   while (searchDir !== "/") {
@@ -105,73 +107,62 @@ export async function loadConfig(cwd: string = process.cwd()): Promise<{
     searchDir = resolve(searchDir, "..");
   }
 
-  // Search for config file
+  // If no app found, use defaults
   if (!appPath) {
-    searchDir = cwd;
-    while (searchDir !== "/") {
-      for (const configFile of CONFIG_FILES) {
-        const candidate = join(searchDir, configFile);
-        if (existsSync(candidate)) {
-          configPath = candidate;
-          break;
-        }
-      }
-      if (configPath) break;
-      searchDir = resolve(searchDir, "..");
-    }
-  }
-
-  const resolvedPath = appPath ?? configPath;
-
-  // If no config found, use defaults
-  if (!resolvedPath) {
     return {
       config: DEFAULT_CONFIG,
       configPath: null,
     };
   }
 
-  // Load and merge config
+  // Load and merge config from App instance
   try {
-    const imported = await import(resolvedPath);
+    const imported = await import(appPath);
     const raw = imported.default ?? imported;
-    const isAppInstance = appPath && raw && typeof raw === "object" && "config" in raw;
-    const appConfig = isAppInstance
-      ? (raw as { config?: SpiteStackAppConfig }).config ?? null
-      : null;
-    const registrations = isAppInstance
-      ? (raw as { registrations?: SpiteStackRegistration[] }).registrations ?? null
-      : null;
-    const partial: PartialConfig = (appConfig ?? raw) as PartialConfig;
-    const config = appConfig ? (appConfig as CompilerConfig) : mergeConfig(partial);
+    const isAppInstance = raw && typeof raw === "object" && "config" in raw;
 
-    // Resolve paths relative to config file
-    const configDir = resolve(resolvedPath, "..");
+    if (!isAppInstance) {
+      throw new Error(
+        `Expected default export to be an App() instance. Got: ${typeof raw}`
+      );
+    }
+
+    const appConfig = (raw as { config?: SpiteStackAppConfig }).config ?? null;
+    const registrations = (raw as { registrations?: SpiteStackRegistration[] }).registrations ?? null;
+
+    // Merge with defaults to ensure all fields have values
+    const partial: PartialConfig = (appConfig ?? {}) as PartialConfig;
+    const config = mergeConfig(partial);
+
+    // Resolve paths relative to app file
+    const configDir = resolve(appPath, "..");
     config.domainDir = resolve(configDir, config.domainDir);
     config.outDir = resolve(configDir, config.outDir);
     config.appPath = appPath;
     config.appConfig = appConfig;
     config.registrations = registrations;
 
-    return { config, configPath: resolvedPath };
+    return { config, configPath: appPath };
   } catch (error) {
     throw new Error(
-      `Failed to load config from ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`
+      `Failed to load App from ${appPath}: ${error instanceof Error ? error.message : String(error)}`
     );
   }
 }
 
 /**
- * Get default config (for `spitestack init`)
+ * Get default app content (for `spitestack init`)
  */
-export function getDefaultConfigContent(): string {
-  return `import { defineConfig } from "@spitestack/compiler";
+export function getDefaultAppContent(): string {
+  return `import App from "@spitestack/compiler/app";
 
-export default defineConfig({
+export default App({
+  // Mode determines schema evolution behavior:
+  // - "greenfield": No lock files, iterate freely (default)
+  // - "production": Lock files enforced, breaking changes require upcasters
+  mode: "greenfield",
+
   domainDir: "./src/domain/aggregates",
-  outDir: "./.spitestack/generated",
-  include: ["**/*.ts"],
-  exclude: ["**/*.test.ts", "**/*.spec.ts"],
 });
 `;
 }

@@ -1,0 +1,298 @@
+import type { GeneratedFile } from "../types";
+import type { SchemaLock, EventSchema, EventSchemaProperty } from "../schema/lock";
+import type { SchemaDiff, EventChange } from "../schema/diff";
+
+// ============================================================================
+// Upcaster Generation Types
+// ============================================================================
+
+export interface UpcasterInfo {
+  aggregateName: string;
+  eventType: string;
+  fromVersion: number;
+  toVersion: number;
+  propertyChanges: {
+    kind: "added" | "removed" | "modified";
+    propertyName: string;
+    oldType?: string;
+    newType?: string;
+  }[];
+}
+
+// ============================================================================
+// Upcaster Generation
+// ============================================================================
+
+/**
+ * Generate TypeScript type from schema property
+ */
+function schemaPropertyToType(prop: EventSchemaProperty): string {
+  if (prop.type.startsWith("literal(")) {
+    return prop.type.slice(8, -1); // Extract the literal value
+  }
+
+  if (prop.type.startsWith("union(")) {
+    const unionTypes = prop.type.slice(6, -1).split("|");
+    return unionTypes.join(" | ");
+  }
+
+  switch (prop.type) {
+    case "string":
+      return "string";
+    case "number":
+      return "number";
+    case "boolean":
+      return "boolean";
+    case "null":
+      return "null";
+    case "undefined":
+      return "undefined";
+    case "array":
+      return `${prop.elementType ?? "unknown"}[]`;
+    case "object":
+      if (prop.properties) {
+        const props = Object.entries(prop.properties)
+          .map(([key, value]) => `${key}: ${schemaPropertyToType(value)}`)
+          .join("; ");
+        return `{ ${props} }`;
+      }
+      return "Record<string, unknown>";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * Generate old version type definition
+ */
+function generateOldVersionType(
+  eventType: string,
+  version: number,
+  oldEvent: EventSchema
+): string {
+  const props = Object.entries(oldEvent.properties)
+    .map(([key, value]) => `  ${key}: ${schemaPropertyToType(value)};`)
+    .join("\n");
+
+  return `type ${eventType}V${version} = {
+  type: "${eventType}";
+${props}
+};`;
+}
+
+/**
+ * Generate new version type definition
+ */
+function generateNewVersionType(
+  eventType: string,
+  version: number,
+  newEvent: EventSchema
+): string {
+  const props = Object.entries(newEvent.properties)
+    .map(([key, value]) => `  ${key}: ${schemaPropertyToType(value)};`)
+    .join("\n");
+
+  return `type ${eventType}V${version} = {
+  type: "${eventType}";
+${props}
+};`;
+}
+
+/**
+ * Generate upcaster function stub
+ */
+function generateUpcasterStub(info: UpcasterInfo): string {
+  const funcName = `upcast${info.eventType}V${info.fromVersion}ToV${info.toVersion}`;
+
+  const todoComments: string[] = [];
+  for (const change of info.propertyChanges) {
+    switch (change.kind) {
+      case "added":
+        todoComments.push(
+          `  // TODO: Provide value for new property '${change.propertyName}' (${change.newType})`
+        );
+        break;
+      case "removed":
+        todoComments.push(
+          `  // TODO: Handle removed property '${change.propertyName}' (was ${change.oldType})`
+        );
+        break;
+      case "modified":
+        todoComments.push(
+          `  // TODO: Convert '${change.propertyName}' from ${change.oldType} to ${change.newType}`
+        );
+        break;
+    }
+  }
+
+  return `export function ${funcName}(
+  event: ${info.eventType}V${info.fromVersion}
+): ${info.eventType}V${info.toVersion} {
+${todoComments.join("\n")}
+  return {
+    ...event,
+    // Add transformed/new properties here
+  } as ${info.eventType}V${info.toVersion};
+}`;
+}
+
+/**
+ * Generate upcaster registry for an aggregate
+ */
+function generateUpcasterRegistry(
+  aggregateName: string,
+  upcasters: UpcasterInfo[]
+): string {
+  const registrations: string[] = [];
+
+  for (const info of upcasters) {
+    const funcName = `upcast${info.eventType}V${info.fromVersion}ToV${info.toVersion}`;
+    registrations.push(
+      `  ["${info.eventType}", ${info.fromVersion}, ${funcName}]`
+    );
+  }
+
+  return `/**
+ * Registry of upcasters for ${aggregateName} events
+ * Each entry is [eventType, fromVersion, upcasterFn]
+ */
+export const ${aggregateName}Upcasters: [string, number, (event: any) => any][] = [
+${registrations.join(",\n")}
+];`;
+}
+
+/**
+ * Generate upcaster file for an aggregate with breaking changes
+ */
+export function generateUpcasterFile(
+  aggregateName: string,
+  oldLock: SchemaLock,
+  newLock: SchemaLock,
+  breakingChanges: EventChange[]
+): GeneratedFile | null {
+  if (breakingChanges.length === 0) {
+    return null;
+  }
+
+  const oldAgg = oldLock.aggregates[aggregateName];
+  const newAgg = newLock.aggregates[aggregateName];
+
+  if (!oldAgg || !newAgg) {
+    return null;
+  }
+
+  const lines: string[] = [
+    `/**`,
+    ` * Upcasters for ${aggregateName} events`,
+    ` * Generated by spitestack compiler`,
+    ` *`,
+    ` * IMPORTANT: Complete the TODO items in each upcaster function`,
+    ` */`,
+    ``,
+  ];
+
+  const upcasters: UpcasterInfo[] = [];
+
+  for (const eventChange of breakingChanges) {
+    const oldEvent = oldAgg.events[eventChange.eventType];
+    const newEvent = newAgg.events[eventChange.eventType];
+
+    if (!oldEvent || !newEvent) {
+      continue;
+    }
+
+    const fromVersion = oldEvent.schemaVersion;
+    const toVersion = fromVersion + 1;
+
+    // Generate type definitions
+    lines.push(generateOldVersionType(eventChange.eventType, fromVersion, oldEvent));
+    lines.push("");
+    lines.push(generateNewVersionType(eventChange.eventType, toVersion, newEvent));
+    lines.push("");
+
+    // Collect upcaster info
+    const info: UpcasterInfo = {
+      aggregateName,
+      eventType: eventChange.eventType,
+      fromVersion,
+      toVersion,
+      propertyChanges: eventChange.propertyChanges.map((p) => ({
+        kind: p.kind,
+        propertyName: p.propertyName,
+        oldType: p.oldType,
+        newType: p.newType,
+      })),
+    };
+
+    upcasters.push(info);
+
+    // Generate upcaster stub
+    lines.push(generateUpcasterStub(info));
+    lines.push("");
+  }
+
+  // Generate registry
+  lines.push(generateUpcasterRegistry(aggregateName, upcasters));
+  lines.push("");
+
+  return {
+    path: `upcasters/${aggregateName.toLowerCase()}.upcaster.ts`,
+    content: lines.join("\n"),
+  };
+}
+
+/**
+ * Generate all upcaster files for breaking changes in a diff
+ */
+export function generateUpcasterFiles(
+  oldLock: SchemaLock,
+  newLock: SchemaLock,
+  diff: SchemaDiff
+): GeneratedFile[] {
+  const files: GeneratedFile[] = [];
+
+  for (const aggChange of diff.aggregateChanges) {
+    if (aggChange.changeType !== "breaking") {
+      continue;
+    }
+
+    const breakingEvents = aggChange.eventChanges.filter(
+      (e) => e.changeType === "breaking"
+    );
+
+    const file = generateUpcasterFile(
+      aggChange.aggregateName,
+      oldLock,
+      newLock,
+      breakingEvents
+    );
+
+    if (file) {
+      files.push(file);
+    }
+  }
+
+  return files;
+}
+
+/**
+ * Generate an index file that exports all upcasters
+ */
+export function generateUpcasterIndexFile(
+  aggregateNames: string[]
+): GeneratedFile {
+  const exports = aggregateNames.map(
+    (name) => `export * from "./${name.toLowerCase()}.upcaster";`
+  );
+
+  return {
+    path: "upcasters/index.ts",
+    content: `/**
+ * Upcaster exports
+ * Generated by spitestack compiler
+ */
+
+${exports.join("\n")}
+`,
+  };
+}

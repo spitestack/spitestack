@@ -46,6 +46,13 @@ const DEFAULT_PUBLIC_SESSION_HEADER = "x-session-id";
 const DEFAULT_PUBLIC_SESSION_REQUIRED = true;
 const DEFAULT_PUBLIC_SESSION_COOKIE = "spitestack_session";
 
+// API Versioning disabled
+const API_VERSIONING_ENABLED = false;
+const CURRENT_API_VERSION = "v1";
+const SUPPORTED_API_VERSIONS = new Set<string>();
+const LATEST_API_ALIAS: string | null = null;
+
+
 export interface RouteOptions {
   db: SpiteDbNapi;
   auth?: Auth;
@@ -71,9 +78,35 @@ export function createCommandHandler(options: RouteOptions) {
     }
 
     const path = url.pathname.slice(basePath.length);
-    const [aggregate, command] = path.split("/").filter(Boolean);
-    if (!aggregate || !command || path.split("/").filter(Boolean).length !== 2) {
-      return new Response("Not found", { status: 404 });
+    const segments = path.split("/").filter(Boolean);
+
+    // Handle API versioning
+    let apiVersion: string | null = null;
+    let aggregate: string;
+    let command: string;
+
+    if (API_VERSIONING_ENABLED) {
+      // Check for version prefix (e.g., /v1/todo/create)
+      if (segments[0]?.startsWith("v") && /^v\d+$/.test(segments[0])) {
+        apiVersion = segments[0];
+        if (!SUPPORTED_API_VERSIONS.has(apiVersion)) {
+          return new Response(`Unsupported API version: ${apiVersion}`, { status: 400 });
+        }
+        [, aggregate, command] = segments;
+      } else {
+        // No version prefix - use current version
+        [aggregate, command] = segments;
+        apiVersion = CURRENT_API_VERSION;
+      }
+
+      if (!aggregate || !command) {
+        return new Response("Not found", { status: 404 });
+      }
+    } else {
+      [aggregate, command] = segments;
+      if (!aggregate || !command || segments.length !== 2) {
+        return new Response("Not found", { status: 404 });
+      }
     }
 
     if (req.method !== "POST") {

@@ -1,4 +1,17 @@
+/**
+ * Mode determines how schema evolution and API contracts are handled.
+ * - "greenfield": No lock files, schemas can change freely. Use during early development.
+ * - "production": Lock files enforced. Breaking changes require upcasters/version bumps.
+ */
+export type SpiteStackMode = "greenfield" | "production";
+
 export interface SpiteStackAppConfig {
+  /**
+   * Mode determines schema evolution behavior.
+   * - "greenfield": No lock files, iterate freely (default)
+   * - "production": Lock files enforced, breaking changes require upcasters
+   */
+  mode?: SpiteStackMode;
   domainDir?: string;
   outDir?: string;
   include?: string[];
@@ -18,10 +31,25 @@ export interface SpiteStackAppConfig {
     publicSessionRequired?: boolean;
     publicTenantId?: string;
   };
+  /** Schema evolution options (relevant in production mode) */
+  schemaEvolution?: {
+    /** Directory for upcaster files */
+    upcasterDir?: string;
+  };
+  /** API versioning options (opt-in for API products) */
+  api?: {
+    /** Enable API contract versioning (default: false) */
+    versioning?: boolean;
+    /** Optional alias for latest version (e.g., "/api") */
+    latestAlias?: string;
+    /** Warn when deprecated API versions are used */
+    deprecationWarnings?: boolean;
+  };
   auth?: unknown;
 }
 
 export interface SpiteStackResolvedConfig {
+  mode: SpiteStackMode;
   domainDir: string;
   outDir: string;
   include: string[];
@@ -40,6 +68,14 @@ export interface SpiteStackResolvedConfig {
     publicSessionHeader: string;
     publicSessionRequired: boolean;
     publicTenantId?: string;
+  };
+  schemaEvolution: {
+    upcasterDir: string;
+  };
+  api: {
+    versioning: boolean;
+    latestAlias?: string;
+    deprecationWarnings: boolean;
   };
   auth?: unknown;
 }
@@ -62,6 +98,7 @@ export interface SpiteStackRegistration {
 }
 
 const DEFAULT_CONFIG: SpiteStackResolvedConfig = {
+  mode: "greenfield",
   domainDir: "./src/domain/aggregates",
   outDir: "./.spitestack/generated",
   include: ["**/*.ts"],
@@ -81,10 +118,18 @@ const DEFAULT_CONFIG: SpiteStackResolvedConfig = {
     publicSessionRequired: true,
     publicTenantId: undefined,
   },
+  schemaEvolution: {
+    upcasterDir: "./.spitestack/upcasters",
+  },
+  api: {
+    versioning: false,
+    deprecationWarnings: true,
+  },
 };
 
 function mergeConfig(config: SpiteStackAppConfig = {}): SpiteStackResolvedConfig {
   return {
+    mode: config.mode ?? DEFAULT_CONFIG.mode,
     domainDir: config.domainDir ?? DEFAULT_CONFIG.domainDir,
     outDir: config.outDir ?? DEFAULT_CONFIG.outDir,
     include: config.include ?? DEFAULT_CONFIG.include,
@@ -105,6 +150,14 @@ function mergeConfig(config: SpiteStackAppConfig = {}): SpiteStackResolvedConfig
       publicSessionRequired:
         config.routes?.publicSessionRequired ?? DEFAULT_CONFIG.routes.publicSessionRequired,
       publicTenantId: config.routes?.publicTenantId ?? DEFAULT_CONFIG.routes.publicTenantId,
+    },
+    schemaEvolution: {
+      upcasterDir: config.schemaEvolution?.upcasterDir ?? DEFAULT_CONFIG.schemaEvolution.upcasterDir,
+    },
+    api: {
+      versioning: config.api?.versioning ?? DEFAULT_CONFIG.api.versioning,
+      latestAlias: config.api?.latestAlias ?? DEFAULT_CONFIG.api.latestAlias,
+      deprecationWarnings: config.api?.deprecationWarnings ?? DEFAULT_CONFIG.api.deprecationWarnings,
     },
     auth: config.auth,
   };
