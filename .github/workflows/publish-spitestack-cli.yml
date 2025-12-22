@@ -27,6 +27,8 @@ jobs:
     name: Publish ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     environment: release
+    env:
+      NPM_CONFIG_PROVENANCE: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +51,18 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "20"
+
+      - name: Debug npm/oidc
+        shell: bash
+        run: |
+          echo "node: $(node --version)"
+          echo "npm: $(npm --version)"
+          if [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            echo "oidc: available"
+          else
+            echo "oidc: missing"
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -105,13 +118,26 @@ jobs:
     needs: publish-platforms
     if: ${{ inputs.publish_wrapper }}
     environment: release
+    env:
+      NPM_CONFIG_PROVENANCE: "true"
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "20"
+
+      - name: Debug npm/oidc
+        shell: bash
+        run: |
+          echo "node: $(node --version)"
+          echo "npm: $(npm --version)"
+          if [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            echo "oidc: available"
+          else
+            echo "oidc: missing"
+          fi
 
       - name: Update versions
         shell: bash
