@@ -12,5 +12,9 @@
   "files": [
     "spitestack.exe"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spitestack/spitestack"
+  },
   "license": "MIT"
 }

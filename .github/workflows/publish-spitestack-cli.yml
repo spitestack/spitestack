@@ -33,10 +33,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-latest
             platform: darwin-arm64
             binary: spitestack
-          - os: macos-12
+          - os: macos-15-intel
             platform: darwin-x64
             binary: spitestack
           - os: ubuntu-latest
