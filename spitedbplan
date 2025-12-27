@@ -1,0 +1,1352 @@
+     SpiteDB Rewrite: Rust → Bun
+
+     Overview
+
+     Rewrite SpiteDB from Rust to pure Bun/TypeScript, replacing SQLite with
+      a custom append-only log storage engine. This simplifies the codebase
+     (no FFI), improves developer experience, and optimizes for event
+     sourcing access patterns.
+
+     Architecture Summary
+
+     ┌──────────────────────────────────────────────────────────────────────
+     ────────────┐
+     │                                  MAIN THREAD                         
+                  │
+     │  ┌───────────────────────────────────────────────────────────────────
+     ─────────┐  │
+     │  │                           SpiteDB (Public API)                    
+              │  │
+     │  │  - append(streamId, events)        - writeTelemetry(record)       
+              │  │
+     │  │  - readStream(streamId, fromRev)   - queryTelemetry(query)        
+              │  │
+     │  │  - readGlobal(fromPos, limit)      - 
+     registerProjection(projection)        │  │
+     │  │  - getStreamRevision(streamId)     - queryProjection(name, key)   
+              │  │
+     │  └───────────────────────────────────────────────────────────────────
+     ─────────┘  │
+     │                                       │                              
+                  │
+     │         ┌─────────────────────────────┼─────────────────────────────┐
+                 │
+     │         ▼                             ▼                             ▼
+                 │
+     │  ┌───────────────┐           ┌─────────────────┐          
+     ┌─────────────┐       │
+     │  │ Event Batcher │           │  StreamIndex    │          │ 
+     Projections │       │
+     │  │               │           │  (in-memory)    │          │ 
+     (in-memory) │       │
+     │  └───────┬───────┘           └─────────────────┘          
+     └─────────────┘       │
+     │          │                                                           
+                  │
+     │  ┌───────┴───────┐                                                   
+                 │
+     │  │Telemetry      │                                                   
+                 │
+     │  │Batcher        │                                                   
+                 │
+     │  └───────┬───────┘                                                   
+                 │
+     │          │                                                           
+                  │
+     └──────────┼───────────────────────────────────────────────────────────
+     ─────────────┘
+                │ msgpack + zero-copy transfer
+                ▼
+     ┌──────────────────────┐  ┌──────────────────────┐  
+     ┌──────────────────────┐
+     │  Event Writer        │  │  Telemetry Writer    │  │  Checkpoint 
+     Worker   │
+     │  Worker              │  │  Worker              │  │  (background)    
+         │
+     │  - receives batch    │  │  - receives batch    │  │  - flushes 
+     indexes   │
+     │  - zstd compress     │  │  - zstd compress     │  │  - flushes projs 
+         │
+     │  - append to log     │  │  - append to log     │  │  - async, no 
+     fsync   │
+     │  - fsync (durable)   │  │  - fsync (durable)   │  │    pressure      
+         │
+     └──────────┬───────────┘  └──────────┬───────────┘  
+     └──────────┬───────────┘
+                │                         │                         │
+                ▼                         ▼                         ▼
+     ┌──────────────────────┐  ┌──────────────────────┐  
+     ┌──────────────────────┐
+     │  events/             │  │  telemetry/          │  │  checkpoints/    
+         │
+     │  ├── 000001.log      │  │  ├── 000001.log      │  │  ├── 
+     event-index.ckpt│
+     │  ├── 000002.log      │  │  ├── 000002.log      │  │  ├── 
+     telem-index.ckpt│
+     │  └── ...             │  │  └── ...             │  │  └── proj-*.ckpt 
+         │
+     │  (source of truth)   │  │  (source of truth)   │  │  (rebuildable)   
+         │
+     └──────────────────────┘  └──────────────────────┘  
+     └──────────────────────┘
+
+     Key Design Decisions
+
+     | Decision      | Choice                                               
+       | Rationale                                         |
+     |---------------|------------------------------------------------------
+     --|---------------------------------------------------|
+     | Storage       | Append-only log files                                
+       | Optimal for event sourcing, no SQLite overhead    |
+     | Compression   | zstd per batch                                       
+       | Fast, good ratio, Bun native support              |
+     | Serialization | msgpack                                              
+       | Compact binary, zero-copy transfer to workers     |
+     | Index         | Segment-aligned, in-memory + LRU                     
+       | Natural time-based eviction, fits access patterns |
+     | Projections   | In-memory + async checkpoint                         
+       | Derived data, can rebuild from log                |
+     | Workers       | 3 total (event writer + telemetry writer + 
+     checkpoint) | Separate logs, independent fsync                  |
+     | Durability    | fsync on data only                                   
+       | Index/projections rebuild from log on recovery    |
+
+     ---
+     Domain-Driven Design
+
+     Ubiquitous Language
+
+     | Term           | Definition                                         |
+     |----------------|----------------------------------------------------|
+     | Event          | Immutable fact that occurred in the domain         |
+     | Stream         | Ordered sequence of events for a single aggregate  |
+     | StreamId       | Unique identifier for a stream                     |
+     | Revision       | Position of an event within its stream (0-indexed) |
+     | GlobalPosition | Position of an event in the global log             |
+     | Batch          | Group of events written atomically                 |
+     | Segment        | Physical file containing multiple batches          |
+     | Projection     | Read model derived from events                     |
+     | Checkpoint     | Point-in-time snapshot for fast recovery           |
+
+     Value Objects (Immutable)
+
+     // value-objects/stream-id.ts
+     class StreamId {
+       private constructor(private readonly value: string) {
+         if (!value || value.length > 256) {
+           throw new InvalidStreamIdError(value);
+         }
+       }
+
+       static from(value: string): StreamId {
+         return new StreamId(value);
+       }
+
+       toString(): string { return this.value; }
+       equals(other: StreamId): boolean { return this.value === other.value;
+      }
+       hash(): number { return hashString(this.value); }
+     }
+
+     // value-objects/global-position.ts
+     class GlobalPosition {
+       private constructor(private readonly value: bigint) {
+         if (value < 0n) throw new InvalidPositionError(value);
+       }
+
+       static from(value: bigint | number): GlobalPosition {
+         return new GlobalPosition(BigInt(value));
+       }
+
+       static readonly BEGINNING = new GlobalPosition(0n);
+
+       toBigInt(): bigint { return this.value; }
+       next(): GlobalPosition { return new GlobalPosition(this.value + 1n); 
+     }
+       equals(other: GlobalPosition): boolean { return this.value === 
+     other.value; }
+       compareTo(other: GlobalPosition): number {
+         return this.value < other.value ? -1 : this.value > other.value ? 1
+      : 0;
+       }
+     }
+
+     // value-objects/revision.ts
+     class Revision {
+       private constructor(private readonly value: number) {}
+
+       static from(value: number): Revision {
+         return new Revision(value);
+       }
+
+       static readonly NONE = new Revision(-1);  // Stream doesn't exist
+       static readonly ANY = new Revision(-2);   // No optimistic 
+     concurrency check
+
+       toNumber(): number { return this.value; }
+       next(): Revision { return new Revision(this.value + 1); }
+       equals(other: Revision): boolean { return this.value === other.value;
+      }
+     }
+
+     // value-objects/tenant-id.ts
+     class TenantId {
+       private constructor(private readonly value: string) {}
+
+       static from(value: string): TenantId { return new TenantId(value); }
+       static readonly DEFAULT = new TenantId('default');
+
+       toString(): string { return this.value; }
+       equals(other: TenantId): boolean { return this.value === other.value;
+      }
+     }
+
+     Entities
+
+     // entities/event.ts
+     class Event {
+       constructor(
+         readonly streamId: StreamId,
+         readonly revision: Revision,
+         readonly globalPosition: GlobalPosition,
+         readonly data: Uint8Array,  // msgpack-encoded payload
+         readonly metadata: EventMetadata,
+         readonly timestamp: number,
+       ) {}
+     }
+
+     // entities/stream.ts
+     class Stream {
+       constructor(
+         readonly id: StreamId,
+         readonly currentRevision: Revision,
+         readonly tenantId: TenantId,
+       ) {}
+
+       expectRevision(expected: Revision): void {
+         if (!expected.equals(Revision.ANY) && 
+     !expected.equals(this.currentRevision)) {
+           throw new ConcurrencyError(this.id, expected, 
+     this.currentRevision);
+         }
+       }
+     }
+
+     Aggregates
+
+     // aggregates/append-command.ts
+     class AppendCommand {
+       constructor(
+         readonly streamId: StreamId,
+         readonly expectedRevision: Revision,
+         readonly events: ReadonlyArray<Uint8Array>,
+         readonly commandId: CommandId,
+         readonly tenantId: TenantId = TenantId.DEFAULT,
+       ) {
+         if (events.length === 0) {
+           throw new EmptyAppendError();
+         }
+       }
+     }
+
+     // aggregates/batch.ts
+     class Batch {
+       constructor(
+         readonly id: BatchId,
+         readonly commands: ReadonlyArray<AppendCommand>,
+         readonly payload: Uint8Array,  // msgpack([...all events])
+         readonly globalPositionStart: GlobalPosition,
+       ) {}
+
+       get eventCount(): number {
+         return this.commands.reduce((sum, cmd) => sum + cmd.events.length, 
+     0);
+       }
+     }
+
+     Domain Services
+
+     // services/append-service.ts
+     interface AppendService {
+       append(command: AppendCommand): Promise<AppendResult>;
+       appendBatch(commands: AppendCommand[]): Promise<AppendResult[]>;
+     }
+
+     // services/read-service.ts
+     interface ReadService {
+       readStream(streamId: StreamId, fromRevision: Revision, limit: 
+     number): Promise<Event[]>;
+       readGlobal(fromPosition: GlobalPosition, limit: number): 
+     Promise<Event[]>;
+       getStreamRevision(streamId: StreamId): Promise<Revision>;
+     }
+
+     // services/projection-service.ts
+     interface ProjectionService {
+       register<TState>(projection: ProjectionDefinition<TState>): void;
+       query<TState>(name: string, key: string): Promise<TState | 
+     undefined>;
+       scan<TState>(name: string, filter?: (state: TState) => boolean): 
+     AsyncIterable<TState>;
+     }
+
+     Repository Pattern
+
+     // repositories/event-repository.ts
+     interface EventRepository {
+       append(batch: Batch): Promise<void>;
+       readByStream(streamId: StreamId, fromRevision: Revision, limit: 
+     number): Promise<Event[]>;
+       readByGlobalPosition(from: GlobalPosition, limit: number): 
+     Promise<Event[]>;
+       getLastGlobalPosition(): Promise<GlobalPosition>;
+     }
+
+     // repositories/stream-repository.ts
+     interface StreamRepository {
+       get(streamId: StreamId, tenantId: TenantId): Promise<Stream | 
+     undefined>;
+       save(stream: Stream): Promise<void>;
+       getSegmentsForStream(streamId: StreamId): Promise<SegmentId[]>;
+     }
+
+     // repositories/projection-repository.ts
+     interface ProjectionRepository<TState> {
+       get(key: string): Promise<TState | undefined>;
+       set(key: string, state: TState): Promise<void>;
+       scan(filter?: (state: TState) => boolean): AsyncIterable<TState>;
+       checkpoint(): Promise<void>;
+       loadCheckpoint(): Promise<void>;
+     }
+
+     ---
+     SOLID Principles & Clean Architecture
+
+     Dependency Structure
+
+     ┌─────────────────────────────────────────────────────────────────┐
+     │                      PUBLIC API (SpiteDB)                        │
+     │                   Depends only on interfaces                     │
+     └─────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+     ┌─────────────────────────────────────────────────────────────────┐
+     │                     APPLICATION SERVICES                         │
+     │              AppendService, ReadService, etc.                    │
+     │                   Orchestrates domain logic                      │
+     └─────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+     ┌─────────────────────────────────────────────────────────────────┐
+     │                       DOMAIN LAYER                               │
+     │         Entities, Value Objects, Domain Services                 │
+     │                    Pure, no I/O dependencies                     │
+     └─────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+     ┌─────────────────────────────────────────────────────────────────┐
+     │                    INFRASTRUCTURE INTERFACES                     │
+     │     FileSystem, Clock, Transport, Serializer, Compressor        │
+     │                      Abstract contracts                          │
+     └─────────────────────────────────────────────────────────────────┘
+                                    │
+                   ┌────────────────┴────────────────┐
+                   ▼                                 ▼
+     ┌──────────────────────────┐     ┌──────────────────────────┐
+     │   PRODUCTION RUNTIME     │     │   SIMULATION RUNTIME     │
+     │   BunFileSystem          │     │   SimulatedFileSystem    │
+     │   BunClock               │     │   SimulatedClock         │
+     │   BunWorkerTransport     │     │   InMemoryTransport      │
+     └──────────────────────────┘     └──────────────────────────┘
+
+     Infrastructure Interfaces
+
+     // interfaces/filesystem.ts
+     interface FileSystem {
+       open(path: string, mode: OpenMode): Promise<FileHandle>;
+       write(handle: FileHandle, data: Uint8Array, offset?: number): 
+     Promise<number>;
+       read(handle: FileHandle, offset: number, length: number): 
+     Promise<Uint8Array>;
+       fsync(handle: FileHandle): Promise<void>;
+       stat(path: string): Promise<FileStat>;
+       close(handle: FileHandle): Promise<void>;
+       truncate(handle: FileHandle, length: number): Promise<void>;
+       rename(from: string, to: string): Promise<void>;
+       unlink(path: string): Promise<void>;
+       mkdir(path: string, recursive?: boolean): Promise<void>;
+       readdir(path: string): Promise<string[]>;
+       exists(path: string): Promise<boolean>;
+     }
+
+     // interfaces/clock.ts
+     interface Clock {
+       now(): number;
+       sleep(ms: number): Promise<void>;
+     }
+
+     // interfaces/transport.ts
+     interface WorkerTransport {
+       send(message: unknown, transfer?: Transferable[]): Promise<unknown>;
+       close(): Promise<void>;
+     }
+
+     // interfaces/serializer.ts
+     interface Serializer {
+       encode<T>(value: T): Uint8Array;
+       decode<T>(data: Uint8Array): T;
+     }
+
+     // interfaces/compressor.ts
+     interface Compressor {
+       compress(data: Uint8Array, level?: number): Uint8Array;
+       decompress(data: Uint8Array): Uint8Array;
+     }
+
+     ---
+     Storage Layer
+
+     Segment File Format
+
+     ┌──────────────────────────────────────────────────────────────────────
+     ────┐
+     │                           SEGMENT FILE                               
+          │
+     ├──────────────────────────────────────────────────────────────────────
+     ────┤
+     │  HEADER (64 bytes)                                                   
+          │
+     │  ┌──────────┬──────────┬──────────┬──────────┬───────────────────────
+     ───┐│
+     │  │ magic    │ version  │ segment  │ created  │ reserved              
+        ││
+     │  │ 4 bytes  │ 4 bytes  │ id       │ timestamp│ (padding)             
+        ││
+     │  │ "SPIT"   │          │ 8 bytes  │ 8 bytes  │                       
+        ││
+     │  └──────────┴──────────┴──────────┴──────────┴───────────────────────
+     ───┘│
+     ├──────────────────────────────────────────────────────────────────────
+     ────┤
+     │  RECORDS (variable)                                                  
+          │
+     │  
+     ┌────────────────────────────────────────────────────────────────────┐
+      │
+     │  │ RECORD 0                                                          
+      │  │
+     │  │ ┌────────┬────────┬────────┬──────────┬─────────────────────────┐ 
+      │  │
+     │  │ │ magic  │ length │ crc32  │ batch_id │ compressed payload      │ 
+      │  │
+     │  │ │ 4 bytes│ 4 bytes│ 4 bytes│ 8 bytes  │ (zstd + msgpack)        │ 
+      │  │
+     │  │ └────────┴────────┴────────┴──────────┴─────────────────────────┘ 
+      │  │
+     │  
+     └────────────────────────────────────────────────────────────────────┘ 
+      │
+     │  
+     ┌────────────────────────────────────────────────────────────────────┐ 
+      │
+     │  │ RECORD 1                                                          
+      │  │
+     │  │ ...                                                               
+      │  │
+     │  
+     └────────────────────────────────────────────────────────────────────┘ 
+      │
+     │  ...                                                                 
+          │
+     ├──────────────────────────────────────────────────────────────────────
+     ────┤
+     │  FOOTER (written on segment close)                                   
+          │
+     │  ┌──────────┬──────────┬──────────┬──────────┬───────────────────────
+     ───┐│
+     │  │ record   │ first    │ last     │ footer   │ footer                
+        ││
+     │  │ count    │ global   │ global   │ crc32    │ magic                 
+        ││
+     │  │ 4 bytes  │ pos 8b   │ pos 8b   │ 4 bytes  │ 4 bytes "TOOF"        
+        ││
+     │  └──────────┴──────────┴──────────┴──────────┴───────────────────────
+     ───┘│
+     └──────────────────────────────────────────────────────────────────────
+     ────┘
+
+     Record Payload Structure (after decompression)
+
+     interface RecordPayload {
+       commands: Array<{
+         streamId: string;
+         commandId: string;
+         expectedRevision: number;
+         tenantId: string;
+         eventCount: number;
+         // Events are stored sequentially in the events array
+       }>;
+       events: Array<{
+         // Raw event data (msgpack-encoded by caller)
+         data: Uint8Array;
+         // Metadata
+         timestamp: number;
+       }>;
+       metadata: {
+         batchId: string;
+         globalPositionStart: bigint;
+       };
+     }
+
+     Segment Writer (Worker)
+
+     // storage/segment-writer.ts
+     class SegmentWriter {
+       private currentSegment: FileHandle | null = null;
+       private currentSegmentId: number = 0;
+       private currentPosition: number = 0;
+       private readonly maxSegmentSize: number;
+
+       constructor(
+         private readonly fs: FileSystem,
+         private readonly compressor: Compressor,
+         private readonly config: SegmentConfig,
+       ) {
+         this.maxSegmentSize = config.maxSegmentSizeBytes ?? 128 * 1024 * 
+     1024; // 128MB
+       }
+
+       async append(batch: Batch): Promise<RecordLocation> {
+         await this.ensureSegmentOpen();
+
+         // Compress payload
+         const compressed = this.compressor.compress(batch.payload, 3);
+
+         // Build record
+         const record = this.buildRecord(batch.id, compressed);
+
+         // Write record
+         const offset = this.currentPosition;
+         await this.fs.write(this.currentSegment!, record);
+
+         // CRITICAL: fsync for durability
+         await this.fs.fsync(this.currentSegment!);
+
+         this.currentPosition += record.byteLength;
+
+         // Roll segment if needed
+         if (this.currentPosition >= this.maxSegmentSize) {
+           await this.rollSegment();
+         }
+
+         return {
+           segmentId: this.currentSegmentId,
+           offset,
+           length: record.byteLength,
+         };
+       }
+
+       private buildRecord(batchId: BatchId, payload: Uint8Array): 
+     Uint8Array {
+         const header = new ArrayBuffer(20);
+         const view = new DataView(header);
+
+         view.setUint32(0, RECORD_MAGIC, true);
+         view.setUint32(4, payload.byteLength, true);
+         view.setUint32(8, crc32(payload), true);
+         view.setBigUint64(12, batchId.toBigInt(), true);
+
+         const record = new Uint8Array(20 + payload.byteLength);
+         record.set(new Uint8Array(header), 0);
+         record.set(payload, 20);
+
+         return record;
+       }
+     }
+
+     ---
+     Index Layer
+
+     Stream Index (In-Memory)
+
+     // index/stream-index.ts
+     class StreamIndex {
+       // stream → list of (revision, segment, offset)
+       private readonly streams = new Map<string, StreamEntry[]>();
+       private lastGlobalPosition: GlobalPosition = 
+     GlobalPosition.BEGINNING;
+
+       add(event: IndexEntry): void {
+         const key = event.streamId.toString();
+         const entries = this.streams.get(key) ?? [];
+         entries.push({
+           revision: event.revision,
+           segmentId: event.segmentId,
+           batchOffset: event.batchOffset,
+           eventOffset: event.eventOffset,
+         });
+         this.streams.set(key, entries);
+         this.lastGlobalPosition = event.globalPosition;
+       }
+
+       getStreamPositions(
+         streamId: StreamId,
+         fromRevision: Revision,
+         limit: number
+       ): StreamEntry[] {
+         const entries = this.streams.get(streamId.toString()) ?? [];
+         return entries
+           .filter(e => e.revision.toNumber() >= fromRevision.toNumber())
+           .slice(0, limit);
+       }
+
+       getCurrentRevision(streamId: StreamId): Revision {
+         const entries = this.streams.get(streamId.toString());
+         if (!entries || entries.length === 0) return Revision.NONE;
+         return entries[entries.length - 1].revision;
+       }
+
+       getSegmentsForStream(streamId: StreamId): SegmentId[] {
+         const entries = this.streams.get(streamId.toString()) ?? [];
+         return [...new Set(entries.map(e => e.segmentId))];
+       }
+     }
+
+     Segment Index (Per-Segment, LRU Cached)
+
+     // index/segment-index.ts
+     class SegmentIndex {
+       // Within a segment: stream → [(revision, batch_offset, 
+     event_offset)]
+       private readonly entries = new Map<string, SegmentEntry[]>();
+       readonly segmentId: SegmentId;
+       readonly globalPositionRange: { start: GlobalPosition; end: 
+     GlobalPosition };
+
+       static async load(
+         fs: FileSystem,
+         path: string,
+         serializer: Serializer
+       ): Promise<SegmentIndex> {
+         const data = await fs.read(/* ... */);
+         return serializer.decode(data);
+       }
+
+       async save(
+         fs: FileSystem,
+         path: string,
+         serializer: Serializer
+       ): Promise<void> {
+         const data = serializer.encode(this.toSerializable());
+         await fs.write(/* ... */);
+         // No fsync needed - can rebuild from segment
+       }
+     }
+
+     // index/segment-index-cache.ts
+     class SegmentIndexCache {
+       private readonly cache: LRUCache<SegmentId, SegmentIndex>;
+
+       constructor(
+         private readonly fs: FileSystem,
+         private readonly config: CacheConfig,
+       ) {
+         this.cache = new LRUCache({
+           max: config.maxCachedSegments ?? 100,
+           dispose: (index) => { /* cleanup */ },
+         });
+       }
+
+       async get(segmentId: SegmentId): Promise<SegmentIndex> {
+         const cached = this.cache.get(segmentId);
+         if (cached) return cached;
+
+         const index = await SegmentIndex.load(
+           this.fs,
+           this.getIndexPath(segmentId),
+           this.serializer,
+         );
+         this.cache.set(segmentId, index);
+         return index;
+       }
+     }
+
+     ---
+     Worker Layer
+
+     Command Batcher (Main Thread)
+
+     // workers/command-batcher.ts
+     interface PendingCommand<T> {
+       command: T;
+       resolve: (result: unknown) => void;
+       reject: (error: Error) => void;
+     }
+
+     class CommandBatcher<TCommand, TResult> {
+       private queue: PendingCommand<TCommand>[] = [];
+       private flushTimer: Timer | null = null;
+
+       constructor(
+         private readonly transport: WorkerTransport,
+         private readonly serializer: Serializer,
+         private readonly options: BatchOptions,
+       ) {}
+
+       submit(command: TCommand): Promise<TResult> {
+         return new Promise((resolve, reject) => {
+           this.queue.push({ command, resolve, reject });
+           this.scheduleFlush();
+         });
+       }
+
+       private scheduleFlush(): void {
+         if (this.queue.length >= this.options.maxSize) {
+           this.flush();
+         } else if (!this.flushTimer) {
+           this.flushTimer = setTimeout(
+             () => this.flush(),
+             this.options.maxWaitMs
+           );
+         }
+       }
+
+       private async flush(): Promise<void> {
+         if (this.flushTimer) {
+           clearTimeout(this.flushTimer);
+           this.flushTimer = null;
+         }
+         if (this.queue.length === 0) return;
+
+         const batch = this.queue.splice(0);
+         const commands = batch.map(p => p.command);
+
+         // Serialize commands (except payload which is already bytes)
+         const message = this.buildMessage(commands);
+
+         try {
+           // Send to worker with zero-copy transfer
+           const response = await this.transport.send(
+             message,
+             [message.payload.buffer]  // Transfer list
+           );
+
+           // Resolve individual promises
+           const results = response as TResult[];
+           batch.forEach((p, i) => p.resolve(results[i]));
+         } catch (error) {
+           batch.forEach(p => p.reject(error as Error));
+         }
+       }
+     }
+
+     Event Writer Worker
+
+     // workers/event-writer.worker.ts
+     import { parentPort } from 'worker_threads';
+
+     class EventWriterWorker {
+       private writer: SegmentWriter;
+       private globalPosition: GlobalPosition;
+
+       constructor(config: WorkerConfig) {
+         this.writer = new SegmentWriter(
+           new BunFileSystem(),
+           new ZstdCompressor(),
+           config.segment,
+         );
+       }
+
+       async handleBatch(message: WriteBatchMessage): 
+     Promise<WriteBatchResult[]> {
+         const { commands, payload } = message;
+
+         // Compress payload (already msgpack-encoded on main thread)
+         const compressed = Bun.zstdCompressSync(payload, { level: 3 });
+
+         // Append to segment
+         const location = await this.writer.append(compressed, 
+     message.batchId);
+
+         // Build results for each command
+         const results: WriteBatchResult[] = [];
+         let eventOffset = 0;
+
+         for (const cmd of commands) {
+           const startRevision = this.getNextRevision(cmd.streamId);
+
+           results.push({
+             streamId: cmd.streamId,
+             startRevision,
+             endRevision: startRevision + cmd.eventCount - 1,
+             globalPositionStart: this.globalPosition,
+             segmentId: location.segmentId,
+             batchOffset: location.offset,
+             eventOffset,
+           });
+
+           this.globalPosition = 
+     this.globalPosition.advance(cmd.eventCount);
+           eventOffset += cmd.eventCount;
+         }
+
+         return results;
+       }
+     }
+
+     // Message handler
+     parentPort?.on('message', async (message) => {
+       const result = await worker.handleBatch(message);
+       parentPort?.postMessage(result);
+     });
+
+     ---
+     Projection Layer
+
+     Projection Definition
+
+     // projections/projection-definition.ts
+     interface ProjectionDefinition<TState, TEvent = unknown> {
+       readonly name: string;
+       readonly initialState: () => TState;
+
+       // Extract key from event (determines which projection row to update)
+       getKey(event: TEvent, metadata: EventMetadata): string;
+
+       // Apply event to state (pure function)
+       apply(state: TState, event: TEvent, metadata: EventMetadata): TState;
+
+       // Optional: define indexes for efficient queries
+       indexes?: ProjectionIndex<TState>[];
+     }
+
+     interface ProjectionIndex<TState> {
+       name: string;
+       getKey(state: TState): string | string[];
+     }
+
+     In-Memory Projection Store
+
+     // projections/projection-store.ts
+     class ProjectionStore<TState> {
+       private readonly state = new Map<string, TState>();
+       private readonly indexes = new Map<string, Map<string, 
+     Set<string>>>();
+       private checkpointPosition: GlobalPosition = 
+     GlobalPosition.BEGINNING;
+
+       constructor(
+         private readonly definition: ProjectionDefinition<TState>,
+       ) {
+         this.initializeIndexes();
+       }
+
+       apply(event: unknown, metadata: EventMetadata): void {
+         const key = this.definition.getKey(event, metadata);
+         const currentState = this.state.get(key) ?? 
+     this.definition.initialState();
+         const newState = this.definition.apply(currentState, event, 
+     metadata);
+
+         this.updateIndexes(key, currentState, newState);
+         this.state.set(key, newState);
+       }
+
+       get(key: string): TState | undefined {
+         return this.state.get(key);
+       }
+
+       getByIndex(indexName: string, indexKey: string): TState[] {
+         const index = this.indexes.get(indexName);
+         if (!index) throw new UnknownIndexError(indexName);
+
+         const keys = index.get(indexKey) ?? new Set();
+         return [...keys].map(k => this.state.get(k)!);
+       }
+
+       *scan(filter?: (state: TState) => boolean): Iterable<TState> {
+         for (const state of this.state.values()) {
+           if (!filter || filter(state)) {
+             yield state;
+           }
+         }
+       }
+
+       // Checkpoint to disk (called by background worker)
+       async checkpoint(
+         fs: FileSystem,
+         path: string,
+         serializer: Serializer
+       ): Promise<void> {
+         const data = serializer.encode({
+           state: Object.fromEntries(this.state),
+           indexes: Object.fromEntries(
+             [...this.indexes].map(([k, v]) => [k, Object.fromEntries(v)])
+           ),
+           checkpointPosition: this.checkpointPosition.toBigInt(),
+         });
+
+         // Write to temp file, then rename (atomic)
+         const tempPath = `${path}.tmp`;
+         const handle = await fs.open(tempPath, 'write');
+         await fs.write(handle, data);
+         await fs.close(handle);
+         await fs.rename(tempPath, path);
+         // No fsync - can rebuild from log
+       }
+     }
+
+     ---
+     Deterministic Simulation Testing
+
+     Simulated File System
+
+     // testing/simulated-filesystem.ts
+     class SimulatedFileSystem implements FileSystem {
+       private files = new Map<string, Uint8Array>();
+       private handles = new Map<number, FileState>();
+       private nextHandle = 1;
+
+       // Fault injection
+       private faults: FaultConfig = {};
+
+       async write(handle: number, data: Uint8Array, offset?: number): 
+     Promise<number> {
+         const state = this.handles.get(handle);
+         if (!state) throw new Error('Invalid handle');
+
+         // Writes go to unflushed buffer (like real OS)
+         state.unflushed.push({ offset: offset ?? state.position, data: new 
+     Uint8Array(data) });
+         state.position += data.length;
+
+         return data.length;
+       }
+
+       async fsync(handle: number): Promise<void> {
+         // Fault injection
+         if (this.faults.fsyncFails) {
+           throw new Error('Simulated fsync failure');
+         }
+         if (this.faults.fsyncDelayMs) {
+           await this.clock.sleep(this.faults.fsyncDelayMs);
+         }
+
+         const state = this.handles.get(handle);
+         if (!state) throw new Error('Invalid handle');
+
+         // Flush to "durable" storage
+         let content = this.files.get(state.path) ?? new Uint8Array(0);
+
+         for (const write of state.unflushed) {
+           if (this.faults.partialWrite) {
+             // Simulate partial write (corruption)
+             const partialData = write.data.slice(0, write.data.length / 2);
+             content = this.applyWrite(content, write.offset, partialData);
+             break;
+           }
+           content = this.applyWrite(content, write.offset, write.data);
+         }
+
+         this.files.set(state.path, content);
+         state.unflushed = [];
+       }
+
+       // Test control methods
+       crash(): void {
+         // Lose all unflushed writes
+         for (const state of this.handles.values()) {
+           state.unflushed = [];
+         }
+         this.handles.clear();
+       }
+
+       injectFault(fault: Partial<FaultConfig>): void {
+         this.faults = { ...this.faults, ...fault };
+       }
+
+       clearFaults(): void {
+         this.faults = {};
+       }
+
+       // Inspection methods for assertions
+       getFileContent(path: string): Uint8Array | undefined {
+         return this.files.get(path);
+       }
+     }
+
+     Simulated Clock
+
+     // testing/simulated-clock.ts
+     class SimulatedClock implements Clock {
+       private currentTime = 0;
+       private waiters: Array<{ time: number; resolve: () => void }> = [];
+
+       now(): number {
+         return this.currentTime;
+       }
+
+       sleep(ms: number): Promise<void> {
+         return new Promise(resolve => {
+           this.waiters.push({ time: this.currentTime + ms, resolve });
+           this.waiters.sort((a, b) => a.time - b.time);
+         });
+       }
+
+       // Test control
+       tick(ms: number): void {
+         this.currentTime += ms;
+         while (this.waiters.length > 0 && this.waiters[0].time <= 
+     this.currentTime) {
+           this.waiters.shift()!.resolve();
+         }
+       }
+
+       advanceTo(time: number): void {
+         if (time < this.currentTime) {
+           throw new Error('Cannot go back in time');
+         }
+         this.tick(time - this.currentTime);
+       }
+     }
+
+     Example Simulation Tests
+
+     // test/simulation/crash-recovery.test.ts
+     describe('Crash Recovery', () => {
+       let fs: SimulatedFileSystem;
+       let clock: SimulatedClock;
+       let store: SpiteDB;
+
+       beforeEach(async () => {
+         fs = new SimulatedFileSystem();
+         clock = new SimulatedClock();
+         store = await SpiteDB.open({
+           path: '/data',
+           fs,
+           clock,
+           transport: new InMemoryTransport(),
+         });
+       });
+
+       it('recovers committed events after crash', async () => {
+         // Write and commit events
+         await store.append('stream-1', [{ type: 'Created' }]);
+         await store.append('stream-2', [{ type: 'Created' }]);
+
+         // Crash
+         fs.crash();
+
+         // Restart
+         const recovered = await SpiteDB.open({ path: '/data', fs, clock });
+         await recovered.recover();
+
+         // Both streams should exist
+         expect(await recovered.readStream('stream-1')).toHaveLength(1);
+         expect(await recovered.readStream('stream-2')).toHaveLength(1);
+       });
+
+       it('loses uncommitted events after crash', async () => {
+         await store.append('stream-1', [{ type: 'Created' }]);
+
+         // Start write but crash before fsync
+         fs.injectFault({ fsyncFails: true });
+         await expect(
+           store.append('stream-2', [{ type: 'Created' }])
+         ).rejects.toThrow();
+
+         fs.crash();
+         fs.clearFaults();
+
+         // Restart
+         const recovered = await SpiteDB.open({ path: '/data', fs, clock });
+         await recovered.recover();
+
+         // Only stream-1 should exist
+         expect(await recovered.readStream('stream-1')).toHaveLength(1);
+         expect(await recovered.readStream('stream-2')).toHaveLength(0);
+       });
+
+       it('detects and truncates corrupted records', async () => {
+         await store.append('stream-1', [{ type: 'Event1' }]);
+         await store.append('stream-1', [{ type: 'Event2' }]);
+
+         // Inject partial write on next append
+         fs.injectFault({ partialWrite: true });
+         await expect(
+           store.append('stream-1', [{ type: 'Event3' }])
+         ).rejects.toThrow();
+
+         fs.crash();
+         fs.clearFaults();
+
+         // Restart - should detect corruption and truncate
+         const recovered = await SpiteDB.open({ path: '/data', fs, clock });
+         await recovered.recover();
+
+         // Only first two events should exist
+         expect(await recovered.readStream('stream-1')).toHaveLength(2);
+       });
+
+       it('rebuilds index from log after crash', async () => {
+         // Write events
+         await store.append('stream-1', [{ type: 'Event1' }]);
+         await store.append('stream-2', [{ type: 'Event1' }]);
+
+         // Advance time and trigger checkpoint
+         clock.tick(10000);
+         await store.forceCheckpoint();
+
+         // Write more events (not checkpointed)
+         await store.append('stream-1', [{ type: 'Event2' }]);
+
+         fs.crash();
+
+         // Restart
+         const recovered = await SpiteDB.open({ path: '/data', fs, clock });
+         await recovered.recover();
+
+         // All events should be recovered (checkpoint + replay)
+         expect(await recovered.readStream('stream-1')).toHaveLength(2);
+         expect(await recovered.readStream('stream-2')).toHaveLength(1);
+       });
+     });
+
+     ---
+     File Structure
+
+     packages/spitedb/
+     ├── src/
+     │   ├── index.ts                    # Public exports
+     │   ├── spitedb.ts                  # Main SpiteDB class
+     │   │
+     │   ├── domain/                     # DDD Domain Layer
+     │   │   ├── value-objects/
+     │   │   │   ├── stream-id.ts
+     │   │   │   ├── global-position.ts
+     │   │   │   ├── revision.ts
+     │   │   │   ├── tenant-id.ts
+     │   │   │   └── batch-id.ts
+     │   │   ├── entities/
+     │   │   │   ├── event.ts
+     │   │   │   └── stream.ts
+     │   │   ├── aggregates/
+     │   │   │   ├── append-command.ts
+     │   │   │   └── batch.ts
+     │   │   ├── services/
+     │   │   │   ├── append-service.ts
+     │   │   │   ├── read-service.ts
+     │   │   │   └── projection-service.ts
+     │   │   ├── repositories/
+     │   │   │   ├── event-repository.ts
+     │   │   │   ├── stream-repository.ts
+     │   │   │   └── projection-repository.ts
+     │   │   └── errors/
+     │   │       ├── concurrency-error.ts
+     │   │       ├── stream-not-found-error.ts
+     │   │       └── corruption-error.ts
+     │   │
+     │   ├── interfaces/                 # Infrastructure Contracts
+     │   │   ├── filesystem.ts
+     │   │   ├── clock.ts
+     │   │   ├── transport.ts
+     │   │   ├── serializer.ts
+     │   │   └── compressor.ts
+     │   │
+     │   ├── storage/                    # Storage Layer
+     │   │   ├── segment-writer.ts
+     │   │   ├── segment-reader.ts
+     │   │   ├── record-builder.ts
+     │   │   ├── record-parser.ts
+     │   │   └── recovery-manager.ts
+     │   │
+     │   ├── index/                      # Index Layer
+     │   │   ├── stream-index.ts
+     │   │   ├── segment-index.ts
+     │   │   ├── segment-index-cache.ts
+     │   │   └── stream-directory.ts
+     │   │
+     │   ├── projections/                # Projection Layer
+     │   │   ├── projection-definition.ts
+     │   │   ├── projection-store.ts
+     │   │   ├── projection-manager.ts
+     │   │   └── checkpoint-manager.ts
+     │   │
+     │   ├── telemetry/                  # Telemetry Layer
+     │   │   ├── telemetry-record.ts
+     │   │   ├── telemetry-store.ts
+     │   │   ├── telemetry-index.ts
+     │   │   └── telemetry-query.ts
+     │   │
+     │   ├── workers/                    # Worker Layer
+     │   │   ├── command-batcher.ts
+     │   │   ├── event-writer.worker.ts
+     │   │   ├── telemetry-writer.worker.ts
+     │   │   └── checkpoint.worker.ts
+     │   │
+     │   ├── runtime/                    # Production Implementations
+     │   │   ├── bun-filesystem.ts
+     │   │   ├── bun-clock.ts
+     │   │   ├── bun-transport.ts
+     │   │   ├── msgpack-serializer.ts
+     │   │   └── zstd-compressor.ts
+     │   │
+     │   └── testing/                    # Simulation Implementations
+     │       ├── simulated-filesystem.ts
+     │       ├── simulated-clock.ts
+     │       ├── in-memory-transport.ts
+     │       └── test-helpers.ts
+     │
+     ├── test/
+     │   ├── unit/                       # Fast, isolated unit tests
+     │   │   ├── domain/
+     │   │   ├── storage/
+     │   │   ├── index/
+     │   │   └── projections/
+     │   ├── integration/                # Tests with real files
+     │   │   ├── append.test.ts
+     │   │   ├── read.test.ts
+     │   │   └── projections.test.ts
+     │   └── simulation/                 # Deterministic simulation tests
+     │       ├── crash-recovery.test.ts
+     │       ├── corruption.test.ts
+     │       └── concurrency.test.ts
+     │
+     ├── package.json
+     ├── tsconfig.json
+     └── README.md
+
+     ---
+     Implementation Phases
+
+     Phase 1: Foundation (Core Abstractions)
+
+     - Set up package structure
+     - Implement value objects (StreamId, GlobalPosition, Revision, etc.)
+     - Implement infrastructure interfaces (FileSystem, Clock, Transport)
+     - Implement production runtime (BunFileSystem, BunClock)
+     - Implement simulation runtime (SimulatedFileSystem, SimulatedClock)
+     - Set up test infrastructure
+
+     Phase 2: Storage Layer
+
+     - Implement record format (header, checksum, serialization)
+     - Implement SegmentWriter (append, fsync)
+     - Implement SegmentReader (read, validate checksum)
+     - Implement RecoveryManager (scan, validate, truncate)
+     - Write simulation tests for crash/corruption scenarios
+
+     Phase 3: Worker Layer
+
+     - Implement WorkerTransport abstraction
+     - Implement BunWorkerTransport
+     - Implement InMemoryTransport for testing
+     - Implement CommandBatcher
+     - Implement EventWriterWorker
+     - Integration test: main thread → worker → segment
+
+     Phase 4: Index Layer
+
+     - Implement StreamIndex (in-memory)
+     - Implement SegmentIndex
+     - Implement SegmentIndexCache (LRU)
+     - Implement async checkpoint flushing
+     - Implement index recovery from log
+
+     Phase 5: Read Path
+
+     - Implement readStream
+     - Implement readGlobal
+     - Implement getStreamRevision
+     - Optimize with segment index cache
+
+     Phase 6: Projections
+
+     - Implement ProjectionDefinition interface
+     - Implement ProjectionStore (in-memory)
+     - Implement ProjectionManager
+     - Implement projection checkpointing
+     - Implement projection recovery from log
+
+     Phase 7: Telemetry Layer
+
+     - Implement TelemetryRecord value object
+     - Implement TelemetryStore (in-memory)
+     - Implement TelemetryIndex
+     - Implement TelemetryWriterWorker
+     - Implement telemetry query API
+     - Implement telemetry checkpointing
+
+     Phase 8: Public API
+
+     - Implement SpiteDB class (main entry point)
+     - Implement configuration and initialization
+     - Implement graceful shutdown
+     - Write comprehensive documentation
+
+     Phase 9: Testing & Hardening
+
+     - Complete unit test coverage
+     - Complete simulation test coverage
+     - Performance benchmarking
+     - Memory profiling
+     - Documentation review
+
+     ---
+     Dependencies
+
+     {
+       "dependencies": {
+         "msgpackr": "^1.10.0",
+         "lru-cache": "^10.0.0"
+       },
+       "devDependencies": {
+         "bun-types": "latest",
+         "@types/node": "^20.0.0"
+       }
+     }
+
+     Note: zstd compression uses Bun's built-in Bun.zstdCompressSync / 
+     Bun.zstdDecompressSync.
+
+     ---
+     Resolved Decisions
+
+     | Decision             | Choice                                        
+            |
+     |----------------------|-----------------------------------------------
+     -------|
+     | Multi-tenancy        | Keep multi-tenant model (TenantId on all 
+     operations) |
+     | Telemetry            | Separate log file (dedicated telemetry 
+     segments)     |
+     | Segment size         | 128MB default (tunable)                       
+            |
+     | Checkpoint frequency | 10s or 10k events (tunable)                   
+            |
+     | Batch size/wait      | 100 commands or 5ms (tunable)                 
+            |
+     | LRU cache size       | 100 segments (tunable)                        
+            |
+
+     Telemetry Architecture
+
+     Telemetry uses the same storage patterns but with its own log:
+
+     data/
+     ├── events/                 # Domain event log
+     │   ├── 000001.log
+     │   └── ...
+     ├── telemetry/              # Telemetry log (separate)
+     │   ├── 000001.log
+     │   └── ...
+     ├── checkpoints/
+     │   ├── event-index.ckpt
+     │   ├── telemetry-index.ckpt
+     │   └── proj-*.ckpt
+     └── meta.json
+
+     Workers:
+     - Event writer worker (domain events)
+     - Telemetry writer worker (telemetry events)
+     - Checkpoint worker (shared, flushes all indexes/projections)
