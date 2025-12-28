@@ -26,15 +26,19 @@ function formatBytes(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 }
 
+let lastPrintedPercent = -1;
+
 function printProgress(downloaded, total) {
   const percent = total ? Math.round((downloaded / total) * 100) : 0;
-  const barWidth = 30;
-  const filled = Math.round((percent / 100) * barWidth);
-  const empty = barWidth - filled;
-  const bar = "█".repeat(filled) + "░".repeat(empty);
 
-  // Use stderr - npm suppresses stdout during postinstall
-  process.stderr.write(`\r  [${bar}] ${percent}% (${formatBytes(downloaded)})`);
+  // Only print at 0%, 25%, 50%, 75%, 100% to avoid spam
+  const milestones = [0, 25, 50, 75, 100];
+  const nearestMilestone = milestones.find(m => percent <= m) || 100;
+
+  if (percent >= nearestMilestone && lastPrintedPercent < nearestMilestone) {
+    lastPrintedPercent = nearestMilestone;
+    console.error(`  ${percent}% (${formatBytes(downloaded)})`);
+  }
 }
 
 async function main() {
