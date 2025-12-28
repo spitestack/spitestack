@@ -5,9 +5,6 @@
  * Downloads the correct binary for the current platform from GitHub Releases.
  */
 
-// Debug: confirm script is running
-console.error("[spitestack] postinstall starting...");
-
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
@@ -78,6 +75,7 @@ async function main() {
     }
 
     console.error("\n  Done!\n");
+    process.exit(0);
   } catch (error) {
     console.error(`\n\n  Failed to download: ${error.message}`);
     console.error(`  URL: ${url}`);
