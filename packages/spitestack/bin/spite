@@ -1,0 +1,9 @@
+#!/bin/sh
+# Spitestack CLI wrapper - executes the downloaded binary
+
+basedir=$(cd "$(dirname "$0")" && pwd)
+
+case "$(uname -s)" in
+  CYGWIN*|MINGW*|MSYS*) exec "$basedir/spite.exe" "$@" ;;
+  *) exec "$basedir/spite-bin" "$@" ;;
+esac

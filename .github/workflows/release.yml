@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            target: bun-darwin-arm64
+            binary: spite-darwin-arm64
+          - platform: darwin-x64
+            target: bun-darwin-x64
+            binary: spite-darwin-x64
+          - platform: linux-x64
+            target: bun-linux-x64
+            binary: spite-linux-x64
+          - platform: linux-arm64
+            target: bun-linux-arm64
+            binary: spite-linux-arm64
+          - platform: windows-x64
+            target: bun-windows-x64
+            binary: spite-windows-x64.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build spitedb runtime
+        run: bun run build
+
+      - name: Build CLI binary
+        run: |
+          mkdir -p dist
+          bun build src/cli/index.ts \
+            --compile \
+            --minify \
+            --target=${{ matrix.target }} \
+            --outfile=dist/${{ matrix.binary }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: dist/${{ matrix.binary }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_REF: ${{ github.ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Determine if prerelease
+        id: prerelease
+        run: |
+          if [[ "$GH_REF" == *"alpha"* ]] || [[ "$GH_REF" == *"beta"* ]] || [[ "$GH_REF" == *"rc"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+
+  publish-npm:
+    name: Publish to npm
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      GH_REF: ${{ github.ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Update package version and publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Extract version from tag (refs/tags/v0.1.0 -> 0.1.0)
+          VERSION="${GH_REF#refs/tags/v}"
+          echo "Publishing version: $VERSION"
+
+          cd packages/spitestack
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+          # Determine npm tag based on version
+          if [[ "$VERSION" == *"alpha"* ]]; then
+            npm publish --access public --tag alpha
+          elif [[ "$VERSION" == *"beta"* ]]; then
+            npm publish --access public --tag beta
+          elif [[ "$VERSION" == *"rc"* ]]; then
+            npm publish --access public --tag rc
+          else
+            npm publish --access public
+          fi

@@ -4,60 +4,24 @@
   "workspaces": {
     "": {
       "name": "spitestack",
-    },
-    "crates/spitedb-napi": {
-      "name": "@spitestack/db",
-      "version": "0.1.0",
-      "devDependencies": {
-        "@napi-rs/cli": "^2.18.0",
-        "@types/node": "^20.10.0",
-        "bun-types": "^1.3.4",
-        "msgpackr": "^1.11.8",
-        "typescript": "^5.3.0",
-      },
-    },
-    "packages/spite-stage": {
-      "name": "@spitestack/stage",
-      "version": "0.0.1",
-      "dependencies": {
-        "@sveltejs/kit": "^2.15.0",
-        "svelte": "^5.16.0",
-      },
-      "devDependencies": {
-        "@sveltejs/adapter-static": "^3.0.6",
-        "@sveltejs/vite-plugin-svelte": "^5.0.0",
-        "svelte-check": "^4.1.0",
-        "typescript": "^5.7.0",
-        "vite": "^6.0.0",
-      },
-    },
-    "packages/spitedb": {
-      "name": "@spitestack/spitedb",
-      "version": "0.0.1",
       "dependencies": {
         "lru-cache": "^10.0.0",
         "msgpackr": "^1.10.0",
       },
       "devDependencies": {
+        "@sveltejs/adapter-static": "^3.0.6",
+        "@sveltejs/kit": "^2.15.0",
+        "@sveltejs/vite-plugin-svelte": "^5.0.0",
         "@types/node": "^20.0.0",
         "bun-types": "latest",
-        "typescript": "^5.0.0",
+        "fast-check": "^3.15.0",
+        "svelte": "^5.16.0",
+        "svelte-check": "^4.1.0",
+        "typescript": "^5.7.0",
+        "vite": "^6.0.0",
       },
       "peerDependencies": {
         "bun": ">=1.0.0",
-      },
-    },
-    "packages/spitestack-cli": {
-      "name": "spitestack",
-      "version": "0.1.0-alpha.5",
-      "bin": {
-        "spitestack": "bin/spitestack.js",
-      },
-      "optionalDependencies": {
-        "@spitestack/cli-darwin-arm64": "0.1.0-alpha.5",
-        "@spitestack/cli-darwin-x64": "0.1.0-alpha.5",
-        "@spitestack/cli-linux-x64-gnu": "0.1.0-alpha.5",
-        "@spitestack/cli-win32-x64-msvc": "0.1.0-alpha.5",
       },
     },
   },
@@ -136,8 +100,6 @@
 
     "@msgpackr-extract/msgpackr-extract-win32-x64": ["@msgpackr-extract/msgpackr-extract-win32-x64@3.0.3", "", { "os": "win32", "cpu": "x64" }, "sha512-x0fWaQtYp4E6sktbsdAqnehxDgEc/VwM7uLsRCYWaiGu0ykYdZPiS8zCWdnjHwyiumousxfBm4SO31eXqwEZhQ=="],
 
-    "@napi-rs/cli": ["@napi-rs/cli@2.18.4", "", { "bin": { "napi": "scripts/index.js" } }, "sha512-SgJeA4df9DE2iAEpr3M2H0OKl/yjtg1BnRI5/JyowS71tUWhrfSu2LT0V3vlHET+g1hBVlrO60PmEXwUEKp8Mg=="],
-
     "@oven/bun-darwin-aarch64": ["@oven/bun-darwin-aarch64@1.3.5", "", { "os": "darwin", "cpu": "arm64" }, "sha512-8GvNtMo0NINM7Emk9cNAviCG3teEgr3BUX9be0+GD029zIagx2Sf54jMui1Eu1IpFm7nWHODuLEefGOQNaJ0gQ=="],
 
     "@oven/bun-darwin-x64": ["@oven/bun-darwin-x64@1.3.5", "", { "os": "darwin", "cpu": "x64" }, "sha512-r33eHQOHAwkuiBJIwmkXIyqONQOQMnd1GMTpDzaxx9vf9+svby80LZO9Hcm1ns6KT/TBRFyODC/0loA7FAaffg=="],
@@ -206,20 +168,6 @@
 
     "@rollup/rollup-win32-x64-msvc": ["@rollup/rollup-win32-x64-msvc@4.54.0", "", { "os": "win32", "cpu": "x64" }, "sha512-hYT5d3YNdSh3mbCU1gwQyPgQd3T2ne0A3KG8KSBdav5TiBg6eInVmV+TeR5uHufiIgSFg0XsOWGW5/RhNcSvPg=="],
 
-    "@spitestack/cli-darwin-arm64": ["@spitestack/cli-darwin-arm64@0.1.0-alpha.5", "", { "os": "darwin", "cpu": "arm64" }, "sha512-+x9YYP2vsVgajWcEvKvEzUMteh+Z31mS/GxhXpECrbZfw2m4TTn50LQoLxkw3ZiwTyk//9SJOg5TSnYPcK36Rw=="],
-
-    "@spitestack/cli-darwin-x64": ["@spitestack/cli-darwin-x64@0.1.0-alpha.5", "", { "os": "darwin", "cpu": "x64" }, "sha512-rdcByXXQcc/Eu54ScaTu/OwFjLDFTR5Xw4vp/WmBhvR8Ai/bHT+uZVWMDcUKxfG9wJpt2Sv7XZCcNGCQcIZZqA=="],
-
-    "@spitestack/cli-linux-x64-gnu": ["@spitestack/cli-linux-x64-gnu@0.1.0-alpha.5", "", { "os": "linux", "cpu": "x64" }, "sha512-BkPVWFZE4wcoQv366286GRPM8aTwkaQnDaiDVX9FaJNdppUMLKTdoStuG2oc+DloOKiABe6p9ELrk2q/k1QxxQ=="],
-
-    "@spitestack/cli-win32-x64-msvc": ["@spitestack/cli-win32-x64-msvc@0.1.0-alpha.5", "", { "os": "win32", "cpu": "x64" }, "sha512-RH0mlFp8tCrddP7xWpb4tgDtAnEv+kRHe0vD4w2Z9SHnLZK0FSEOW4x/XBoiWvesVG+Saqr8k02m9gi0Cao3PQ=="],
-
-    "@spitestack/db": ["@spitestack/db@workspace:crates/spitedb-napi"],
-
-    "@spitestack/spitedb": ["@spitestack/spitedb@workspace:packages/spitedb"],
-
-    "@spitestack/stage": ["@spitestack/stage@workspace:packages/spite-stage"],
-
     "@standard-schema/spec": ["@standard-schema/spec@1.1.0", "", {}, "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="],
 
     "@sveltejs/acorn-typescript": ["@sveltejs/acorn-typescript@1.0.8", "", { "peerDependencies": { "acorn": "^8.9.0" } }, "sha512-esgN+54+q0NjB0Y/4BomT9samII7jGwNy/2a3wNZbT2A2RpmXsXwUt24LvLhx6jUq2gVk4cWEvcRO6MFQbOfNA=="],
@@ -268,6 +216,8 @@
 
     "esrap": ["esrap@2.2.1", "", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.4.15" } }, "sha512-GiYWG34AN/4CUyaWAgunGt0Rxvr1PTMlGC0vvEov/uOQYWne2bpN03Um+k8jT+q3op33mKouP2zeJ6OlM+qeUg=="],
 
+    "fast-check": ["fast-check@3.23.2", "", { "dependencies": { "pure-rand": "^6.1.0" } }, "sha512-h5+1OzzfCC3Ef7VbtKdcv7zsstUQwUDlYpUTvjeUsJAssPgLn7QzbboPtL5ro04Mq0rPOsMzl7q5hIbRs2wD1A=="],
+
     "fdir": ["fdir@6.5.0", "", { "peerDependencies": { "picomatch": "^3 || ^4" }, "optionalPeers": ["picomatch"] }, "sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg=="],
 
     "fsevents": ["fsevents@2.3.3", "", { "os": "darwin" }, "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw=="],
@@ -302,6 +252,8 @@
 
     "postcss": ["postcss@8.5.6", "", { "dependencies": { "nanoid": "^3.3.11", "picocolors": "^1.1.1", "source-map-js": "^1.2.1" } }, "sha512-3Ybi1tAuwAP9s0r1UQ2J4n5Y0G05bJkpUIO0/bI9MhwmD70S5aTWbXGBwxHrelT+XM1k6dM0pk+SwNkpTRN7Pg=="],
 
+    "pure-rand": ["pure-rand@6.1.0", "", {}, "sha512-bVWawvoZoBYpp6yIoQtQXHZjmz35RSVHnUOTefl8Vcjr8snTPY1wnpSPMWekcFwbxI6gtmT7rSYPFvz71ldiOA=="],
+
     "readdirp": ["readdirp@4.1.2", "", {}, "sha512-GDhwkLfywWL2s6vEjyhri+eXmfH6j1L7JE27WhqLeYzoh/A3DBaYGEj2H/HFZCn/kMfim73FXxEJTw06WtxQwg=="],
 
     "rollup": ["rollup@4.54.0", "", { "dependencies": { "@types/estree": "1.0.8" }, "optionalDependencies": { "@rollup/rollup-android-arm-eabi": "4.54.0", "@rollup/rollup-android-arm64": "4.54.0", "@rollup/rollup-darwin-arm64": "4.54.0", "@rollup/rollup-darwin-x64": "4.54.0", "@rollup/rollup-freebsd-arm64": "4.54.0", "@rollup/rollup-freebsd-x64": "4.54.0", "@rollup/rollup-linux-arm-gnueabihf": "4.54.0", "@rollup/rollup-linux-arm-musleabihf": "4.54.0", "@rollup/rollup-linux-arm64-gnu": "4.54.0", "@rollup/rollup-linux-arm64-musl": "4.54.0", "@rollup/rollup-linux-loong64-gnu": "4.54.0", "@rollup/rollup-linux-ppc64-gnu": "4.54.0", "@rollup/rollup-linux-riscv64-gnu": "4.54.0", "@rollup/rollup-linux-riscv64-musl": "4.54.0", "@rollup/rollup-linux-s390x-gnu": "4.54.0", "@rollup/rollup-linux-x64-gnu": "4.54.0", "@rollup/rollup-linux-x64-musl": "4.54.0", "@rollup/rollup-openharmony-arm64": "4.54.0", "@rollup/rollup-win32-arm64-msvc": "4.54.0", "@rollup/rollup-win32-ia32-msvc": "4.54.0", "@rollup/rollup-win32-x64-gnu": "4.54.0", "@rollup/rollup-win32-x64-msvc": "4.54.0", "fsevents": "~2.3.2" }, "bin": { "rollup": "dist/bin/rollup" } }, "sha512-3nk8Y3a9Ea8szgKhinMlGMhGMw89mqule3KWczxhIzqudyHdCIOHw8WJlj/r329fACjKLEh13ZSk7oE22kyeIw=="],
@@ -313,8 +265,6 @@
     "sirv": ["sirv@3.0.2", "", { "dependencies": { "@polka/url": "^1.0.0-next.24", "mrmime": "^2.0.0", "totalist": "^3.0.0" } }, "sha512-2wcC/oGxHis/BoHkkPwldgiPSYcpZK3JU28WoMVv55yHJgcZ8rlXvuG9iZggz+sU1d4bRgIGASwyWqjxu3FM0g=="],
 
     "source-map-js": ["source-map-js@1.2.1", "", {}, "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA=="],
-
-    "spitestack": ["spitestack@workspace:packages/spitestack-cli"],
 
     "svelte": ["svelte@5.46.0", "", { "dependencies": { "@jridgewell/remapping": "^2.3.4", "@jridgewell/sourcemap-codec": "^1.5.0", "@sveltejs/acorn-typescript": "^1.0.5", "@types/estree": "^1.0.5", "acorn": "^8.12.1", "aria-query": "^5.3.1", "axobject-query": "^4.1.0", "clsx": "^2.1.1", "devalue": "^5.5.0", "esm-env": "^1.2.1", "esrap": "^2.2.1", "is-reference": "^3.0.3", "locate-character": "^3.0.0", "magic-string": "^0.30.11", "zimmerframe": "^1.1.2" } }, "sha512-ZhLtvroYxUxr+HQJfMZEDRsGsmU46x12RvAv/zi9584f5KOX7bUrEbhPJ7cKFmUvZTJXi/CFZUYwDC6M1FigPw=="],
 

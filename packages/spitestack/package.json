@@ -1,0 +1,30 @@
+{
+  "name": "spitestack",
+  "version": "0.1.0",
+  "description": "Event sourcing framework - code angry",
+  "license": "MIT",
+  "bin": {
+    "spite": "./bin/spite"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spitestack/spitestack"
+  },
+  "homepage": "https://github.com/spitestack/spitestack",
+  "bugs": {
+    "url": "https://github.com/spitestack/spitestack/issues"
+  },
+  "keywords": [
+    "event-sourcing",
+    "cqrs",
+    "ddd",
+    "event-store",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,12 +1,44 @@
 {
   "name": "spitestack",
+  "version": "0.1.0",
   "private": true,
-  "workspaces": [
-    "packages/*",
-    "crates/spitedb-napi"
-  ],
+  "type": "module",
+  "bin": {
+    "spite": "./src/cli/index.ts"
+  },
   "scripts": {
-    "build": "bun run --filter '*' build",
-    "test": "bun run --filter '*' test"
+    "build:spitedb": "cd lib/spitedb && bun run scripts/build-runtime.ts && bun run scripts/build-types.ts",
+    "build:embed": "bun run scripts/embed-runtime.ts",
+    "build": "bun run build:spitedb && bun run build:embed",
+    "build:cli": "bun build ./src/cli/index.ts --compile --outfile=./dist/spite --minify",
+    "spite": "bun run ./src/cli/index.ts",
+    "test": "bun test lib/compiler && bun test test/e2e",
+    "test:compiler": "bun test lib/compiler",
+    "test:spitedb": "bun test lib/spitedb",
+    "test:stage": "bun test lib/stage",
+    "test:e2e": "bun test test/e2e",
+    "typecheck": "tsc --noEmit",
+    "bench:spitedb": "bun run lib/spitedb/bench/load-test.ts",
+    "stage:dev": "cd lib/stage && vite dev",
+    "stage:build": "cd lib/stage && vite build"
+  },
+  "dependencies": {
+    "msgpackr": "^1.10.0",
+    "lru-cache": "^10.0.0"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.6",
+    "@sveltejs/kit": "^2.15.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "bun-types": "latest",
+    "fast-check": "^3.15.0",
+    "svelte": "^5.16.0",
+    "svelte-check": "^4.1.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  },
+  "peerDependencies": {
+    "bun": ">=1.0.0"
   }
 }
